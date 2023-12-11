@@ -1,0 +1,15 @@
+yombir
+
+yombir.kdev4
+
+.kdev4/*
+
+**/**/node_modules
+
+build/*
+
+videos/*
+!videos/README.md
+
+captures/*
+!captures/README.md

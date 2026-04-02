@@ -309,6 +309,26 @@ class Tiny1BUvcCtrl:
     def get_ir_sensor_flag(self) -> int:
         return self.standard_read(0x018A, 0x0100, 1)[0]
 
+    def get_shutter_auto_flag(self) -> int:
+        # reverse-mapped from libiruvc: cmd=0x038A, index=0x0100, len=1
+        return self.standard_read(0x038A, 0x0100, 1)[0]
+
+    def set_shutter_auto_flag(self, auto_flag: int) -> None:
+        # reverse-mapped from libiruvc: cmd=0x03C4, index=0x0100, len=1
+        self.standard_write(0x03C4, 0x0100, bytes([auto_flag & 0xFF]))
+
+    def set_shutter_vtemp_thd(self, vtemp_thd: int) -> None:
+        # reverse-mapped from libiruvc: cmd=0x03C4, index=0x0101, len=1
+        self.standard_write(0x03C4, 0x0101, bytes([vtemp_thd & 0xFF]))
+
+    def set_shutter_min_interval(self, min_interval: int) -> None:
+        # reverse-mapped from libiruvc: cmd=0x03C4, index=0x0102, len=1
+        self.standard_write(0x03C4, 0x0102, bytes([min_interval & 0xFF]))
+
+    def set_shutter_max_interval(self, max_interval: int) -> None:
+        # reverse-mapped from libiruvc: cmd=0x03C4, index=0x0103, len=1
+        self.standard_write(0x03C4, 0x0103, bytes([max_interval & 0xFF]))
+
     def tpd_get_env_param(self, param: int) -> dict:
         if param in (0x0100, 0x0101):
             n = 1
@@ -357,7 +377,20 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("info", help="show resolved USB path and ids")
     sub.add_parser("vtemp", help="read IR sensor vtemp raw value")
     sub.add_parser("sensor-flag", help="read IR sensor gain flag")
+    sub.add_parser("shutter-auto-get", help="read shutter auto state flag")
     sub.add_parser("shutter-manual", help="trigger manual shutter command")
+
+    auto_set = sub.add_parser("shutter-auto-set", help="set shutter auto flag (0=off, 1=on)")
+    auto_set.add_argument("--value", required=True, type=_parse_int, help="0 or 1")
+
+    sh_min = sub.add_parser("shutter-min-set", help="set shutter minimum interval (byte value)")
+    sh_min.add_argument("--value", required=True, type=_parse_int, help="0-255")
+
+    sh_max = sub.add_parser("shutter-max-set", help="set shutter maximum interval (byte value)")
+    sh_max.add_argument("--value", required=True, type=_parse_int, help="0-255")
+
+    sh_vt = sub.add_parser("shutter-vtemp-thd-set", help="set shutter vtemp threshold (byte value)")
+    sh_vt.add_argument("--value", required=True, type=_parse_int, help="0-255")
 
     env = sub.add_parser("env-get", help="read environment parameter via cmd 0x68f")
     env.add_argument(
@@ -424,9 +457,23 @@ def main() -> int:
             out["result"] = dev.get_ir_sensor_vtemp()
         elif args.action == "sensor-flag":
             out["result"] = {"gain_flag": dev.get_ir_sensor_flag()}
+        elif args.action == "shutter-auto-get":
+            out["result"] = {"auto_flag": dev.get_shutter_auto_flag()}
         elif args.action == "shutter-manual":
             dev.shutter_manual()
             out["result"] = {"message": "shutter manual command sent"}
+        elif args.action == "shutter-auto-set":
+            dev.set_shutter_auto_flag(args.value)
+            out["result"] = {"message": "shutter auto flag updated", "value": args.value & 0xFF}
+        elif args.action == "shutter-min-set":
+            dev.set_shutter_min_interval(args.value)
+            out["result"] = {"message": "shutter min interval updated", "value": args.value & 0xFF}
+        elif args.action == "shutter-max-set":
+            dev.set_shutter_max_interval(args.value)
+            out["result"] = {"message": "shutter max interval updated", "value": args.value & 0xFF}
+        elif args.action == "shutter-vtemp-thd-set":
+            dev.set_shutter_vtemp_thd(args.value)
+            out["result"] = {"message": "shutter vtemp threshold updated", "value": args.value & 0xFF}
         elif args.action == "env-get":
             param = _map_env_param(args.param)
             out["result"] = dev.tpd_get_env_param(param)

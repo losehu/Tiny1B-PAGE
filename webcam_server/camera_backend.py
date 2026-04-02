@@ -138,6 +138,230 @@ class CameraVtempSampler:
             return self._with_age_locked(now, self._last_result)
 
 
+class CameraShutterScheduler:
+    def __init__(
+        self,
+        interval_sec: float = 10.0,
+        disable_auto: bool = True,
+        min_interval: int = None,
+        max_interval: int = None,
+    ):
+        self._tool = _TINY1B_UVC_MODULE
+        self._interval_sec = max(0.0, float(interval_sec))
+        self._disable_auto = bool(disable_auto)
+        self._min_interval = None if min_interval is None else max(0, min(255, int(min_interval)))
+        self._max_interval = None if max_interval is None else max(0, min(255, int(max_interval)))
+        self._lock = threading.Lock()
+        self._camera_manager = None
+        self._ctrl = None
+        self._device = None
+        self._policy_applied_device = None
+        self._policy_applied_signature = None
+        self._stop_evt = threading.Event()
+        self._thread = None
+        self._next_trigger_ts = 0.0
+        self._trigger_count = 0
+        self._error_count = 0
+        self._last_trigger_ts = 0.0
+        self._last_ok = None
+        self._last_error = ""
+
+    def _reset_ctrl_locked(self):
+        self._ctrl = None
+        self._device = None
+        self._policy_applied_device = None
+        self._policy_applied_signature = None
+
+    def _apply_policy_locked(self, video_device: str):
+        signature = (self._disable_auto, self._min_interval, self._max_interval)
+        if self._policy_applied_device == video_device and self._policy_applied_signature == signature:
+            return
+        if self._ctrl is None:
+            return
+        try:
+            # auto=1: firmware decides shutter; auto=0: firmware auto shutter disabled.
+            self._ctrl.set_shutter_auto_flag(0 if self._disable_auto else 1)
+            if self._min_interval is not None:
+                self._ctrl.set_shutter_min_interval(self._min_interval)
+            if self._max_interval is not None:
+                self._ctrl.set_shutter_max_interval(self._max_interval)
+            self._policy_applied_device = video_device
+            self._policy_applied_signature = signature
+            self._last_ok = True
+            self._last_error = ""
+        except Exception as exc:
+            self._error_count += 1
+            self._last_ok = False
+            self._last_error = f"apply shutter policy failed: {exc}"
+
+    def _ensure_policy_applied_locked(self, video_device: str):
+        signature = (self._disable_auto, self._min_interval, self._max_interval)
+        if self._policy_applied_device == video_device and self._policy_applied_signature == signature:
+            return
+        if self._tool is None:
+            self._error_count += 1
+            self._last_ok = False
+            self._last_error = "tiny1b_uvc_cmd module unavailable"
+            return
+        try:
+            if self._ctrl is None or self._device != video_device:
+                ep0 = self._tool.resolve_usb_path_from_video(video_device)
+                self._ctrl = self._tool.Tiny1BUvcCtrl(ep0)
+                self._device = video_device
+            self._apply_policy_locked(video_device)
+        except Exception as exc:
+            self._reset_ctrl_locked()
+            self._error_count += 1
+            self._last_ok = False
+            self._last_error = str(exc)
+
+    def _trigger_manual_shutter_locked(self, video_device: str):
+        if self._tool is None:
+            self._last_ok = False
+            self._last_error = "tiny1b_uvc_cmd module unavailable"
+            self._error_count += 1
+            return False
+        try:
+            if self._ctrl is None or self._device != video_device:
+                ep0 = self._tool.resolve_usb_path_from_video(video_device)
+                self._ctrl = self._tool.Tiny1BUvcCtrl(ep0)
+                self._device = video_device
+            self._apply_policy_locked(video_device)
+            self._ctrl.shutter_manual()
+            self._trigger_count += 1
+            self._last_trigger_ts = time.time()
+            self._last_ok = True
+            self._last_error = ""
+            return True
+        except Exception as exc:
+            self._reset_ctrl_locked()
+            self._error_count += 1
+            self._last_ok = False
+            self._last_error = str(exc)
+            return False
+
+    def _loop(self):
+        # Trigger manual shutter at a fixed cadence while camera is running.
+        while not self._stop_evt.wait(0.2):
+            if self._camera_manager is None:
+                continue
+
+            status = self._camera_manager.get_status()
+            running = bool(status.get("running"))
+            device = status.get("device")
+            now = time.time()
+
+            if not running or not device:
+                with self._lock:
+                    self._next_trigger_ts = 0.0
+                    self._reset_ctrl_locked()
+                continue
+
+            with self._lock:
+                # Apply auto-shutter policy immediately after camera starts.
+                self._ensure_policy_applied_locked(device)
+                if self._interval_sec <= 0.0:
+                    self._next_trigger_ts = 0.0
+                    continue
+                if self._next_trigger_ts <= 0.0:
+                    self._next_trigger_ts = now + self._interval_sec
+                    continue
+                if now < self._next_trigger_ts:
+                    continue
+                self._trigger_manual_shutter_locked(device)
+                self._next_trigger_ts = now + self._interval_sec
+
+    def start(self, camera_manager: "CameraManager"):
+        self._camera_manager = camera_manager
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_evt.set()
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout=1.0)
+
+    def update_config(self, disable_auto=None, min_interval=None, max_interval=None):
+        with self._lock:
+            if disable_auto is not None:
+                self._disable_auto = bool(disable_auto)
+            if min_interval is not None:
+                self._min_interval = max(1, min(120, int(min_interval)))
+            if max_interval is not None:
+                self._max_interval = max(1, min(120, int(max_interval)))
+
+            # Force policy re-apply on next running check.
+            self._policy_applied_device = None
+            self._policy_applied_signature = None
+            self._next_trigger_ts = 0.0
+
+            if self._device and self._ctrl is not None:
+                self._apply_policy_locked(self._device)
+            return self._status_locked()
+
+    def trigger_once(self):
+        if self._camera_manager is None:
+            return {
+                "ok": False,
+                "status_code": 503,
+                "error": "camera manager not ready",
+                "shutter_scheduler": self.status(),
+            }
+
+        cam = self._camera_manager.get_status()
+        running = bool(cam.get("running"))
+        device = cam.get("device")
+        if not running or not device:
+            return {
+                "ok": False,
+                "status_code": 409,
+                "error": "camera not running",
+                "shutter_scheduler": self.status(),
+            }
+
+        with self._lock:
+            ok = self._trigger_manual_shutter_locked(device)
+            snap = self._status_locked()
+            err = self._last_error
+        if not ok:
+            return {
+                "ok": False,
+                "status_code": 500,
+                "error": err or "manual shutter trigger failed",
+                "shutter_scheduler": snap,
+            }
+        return {"ok": True, "shutter_scheduler": snap}
+
+    def status(self):
+        with self._lock:
+            return self._status_locked()
+
+    def _status_locked(self):
+        now = time.time()
+        next_in = None
+        if self._next_trigger_ts > 0.0:
+            next_in = round(max(0.0, self._next_trigger_ts - now), 2)
+        age = None
+        if self._last_trigger_ts > 0.0:
+            age = round(max(0.0, now - self._last_trigger_ts), 2)
+        return {
+            "enabled": self._interval_sec > 0.0,
+            "interval_sec": self._interval_sec,
+            "disable_auto": self._disable_auto,
+            "min_interval": self._min_interval,
+            "max_interval": self._max_interval,
+            "next_trigger_in_sec": next_in,
+            "trigger_count": self._trigger_count,
+            "error_count": self._error_count,
+            "last_trigger_age_sec": age,
+            "last_ok": self._last_ok,
+            "last_error": self._last_error,
+        }
+
+
 class SystemMetricsSampler:
     def __init__(self, camera_vtemp_sampler: CameraVtempSampler = None):
         self._lock = threading.Lock()
@@ -1444,6 +1668,7 @@ class CameraHandler(BaseHTTPRequestHandler):
     metrics: SystemMetricsSampler = None
     terminal: TerminalManager = None
     pty_terminal: PtyTerminalManager = None
+    shutter_scheduler: CameraShutterScheduler = None
 
     def _json(self, code: int, payload: dict):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -1452,7 +1677,10 @@ class CameraHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -1467,7 +1695,17 @@ class CameraHandler(BaseHTTPRequestHandler):
 
         if path == "/api/metrics":
             camera_status = self.manager.get_status()
-            self._json(200, self.metrics.snapshot(camera_status))
+            payload = self.metrics.snapshot(camera_status)
+            if self.shutter_scheduler is not None:
+                payload["shutter_scheduler"] = self.shutter_scheduler.status()
+            self._json(200, payload)
+            return
+
+        if path == "/api/shutter/config":
+            if self.shutter_scheduler is None:
+                self._json(503, {"error": "shutter scheduler not ready"})
+                return
+            self._json(200, {"ok": True, "shutter_scheduler": self.shutter_scheduler.status()})
             return
 
         if path == "/api/terminal/session/read":
@@ -1584,6 +1822,114 @@ class CameraHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/api/shutter/trigger":
+            if self.shutter_scheduler is None:
+                self._json(503, {"error": "shutter scheduler not ready"})
+                return
+            result = self.shutter_scheduler.trigger_once()
+            if result.get("ok"):
+                self._json(200, result)
+                return
+            code = int(result.get("status_code") or 500)
+            self._json(
+                code,
+                {
+                    "error": result.get("error") or "manual shutter trigger failed",
+                    "shutter_scheduler": result.get("shutter_scheduler"),
+                },
+            )
+            return
+
+        if path == "/api/shutter/config":
+            if self.shutter_scheduler is None:
+                self._json(503, {"error": "shutter scheduler not ready"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except Exception:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8", errors="ignore"))
+            except Exception:
+                self._json(400, {"error": "invalid json"})
+                return
+            if not isinstance(payload, dict):
+                self._json(400, {"error": "invalid payload"})
+                return
+
+            disable_auto = None
+            mode = payload.get("mode")
+            if mode is not None:
+                mode_s = str(mode).strip().lower()
+                if mode_s in ("manual", "hand", "off"):
+                    disable_auto = True
+                elif mode_s in ("auto", "on"):
+                    disable_auto = False
+                else:
+                    self._json(400, {"error": "invalid mode, expected auto/manual"})
+                    return
+
+            if "disable_auto" in payload:
+                raw_bool = payload.get("disable_auto")
+                if isinstance(raw_bool, bool):
+                    disable_auto = raw_bool
+                elif isinstance(raw_bool, (int, float)):
+                    disable_auto = bool(int(raw_bool))
+                elif isinstance(raw_bool, str):
+                    b = raw_bool.strip().lower()
+                    if b in ("1", "true", "yes", "on", "manual"):
+                        disable_auto = True
+                    elif b in ("0", "false", "no", "off", "auto"):
+                        disable_auto = False
+                    else:
+                        self._json(400, {"error": "invalid disable_auto value"})
+                        return
+                else:
+                    self._json(400, {"error": "invalid disable_auto type"})
+                    return
+
+            min_interval = None
+            if "min_interval" in payload and payload.get("min_interval") is not None:
+                try:
+                    min_interval = int(payload.get("min_interval"))
+                except Exception:
+                    self._json(400, {"error": "min_interval must be integer"})
+                    return
+                if not (1 <= min_interval <= 120):
+                    self._json(400, {"error": "min_interval out of range (1~120)"})
+                    return
+
+            max_interval = None
+            if "max_interval" in payload and payload.get("max_interval") is not None:
+                try:
+                    max_interval = int(payload.get("max_interval"))
+                except Exception:
+                    self._json(400, {"error": "max_interval must be integer"})
+                    return
+                if not (1 <= max_interval <= 120):
+                    self._json(400, {"error": "max_interval out of range (1~120)"})
+                    return
+
+            current = self.shutter_scheduler.status()
+            eff_min = min_interval if min_interval is not None else current.get("min_interval")
+            eff_max = max_interval if max_interval is not None else current.get("max_interval")
+            if (
+                eff_min is not None
+                and eff_max is not None
+                and int(eff_min) > int(eff_max)
+            ):
+                self._json(400, {"error": "min_interval cannot be greater than max_interval"})
+                return
+
+            result = self.shutter_scheduler.update_config(
+                disable_auto=disable_auto,
+                min_interval=min_interval,
+                max_interval=max_interval,
+            )
+            self._json(200, {"ok": True, "shutter_scheduler": result})
+            return
+
         if path == "/api/terminal/session/start":
             if self.pty_terminal is None:
                 self._json(503, {"error": "pty terminal not ready"})
@@ -1714,6 +2060,30 @@ def main():
     parser = argparse.ArgumentParser(description="Camera backend for LAN preview")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument(
+        "--shutter-interval-sec",
+        type=float,
+        default=10.0,
+        help="manual shutter refresh interval in seconds while camera is running (<=0 disables)",
+    )
+    parser.add_argument(
+        "--shutter-disable-auto",
+        type=int,
+        default=0,
+        help="disable camera firmware auto shutter via UVC command on startup (1=on, 0=off)",
+    )
+    parser.add_argument(
+        "--shutter-min-interval",
+        type=int,
+        default=30,
+        help="set firmware shutter minimum interval (0-255); applied when auto-shutter policy is configured",
+    )
+    parser.add_argument(
+        "--shutter-max-interval",
+        type=int,
+        default=90,
+        help="set firmware shutter maximum interval (0-255); applied when auto-shutter policy is configured",
+    )
     args = parser.parse_args()
 
     manager = CameraManager()
@@ -1721,10 +2091,18 @@ def main():
     metrics = SystemMetricsSampler(camera_vtemp_sampler=camera_vtemp_sampler)
     terminal = TerminalManager()
     pty_terminal = PtyTerminalManager()
+    shutter_scheduler = CameraShutterScheduler(
+        interval_sec=args.shutter_interval_sec,
+        disable_auto=bool(args.shutter_disable_auto),
+        min_interval=args.shutter_min_interval,
+        max_interval=args.shutter_max_interval,
+    )
+    shutter_scheduler.start(manager)
     CameraHandler.manager = manager
     CameraHandler.metrics = metrics
     CameraHandler.terminal = terminal
     CameraHandler.pty_terminal = pty_terminal
+    CameraHandler.shutter_scheduler = shutter_scheduler
     server = ThreadingHTTPServer((args.host, args.port), CameraHandler)
 
     try:
@@ -1734,6 +2112,10 @@ def main():
     finally:
         try:
             pty_terminal.stop()
+        except Exception:
+            pass
+        try:
+            shutter_scheduler.stop()
         except Exception:
             pass
         manager.stop()

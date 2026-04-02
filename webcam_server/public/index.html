@@ -74,7 +74,14 @@
       gap: 8px;
       flex-wrap: wrap;
     }
-    .norm-range span {
+    .shutter-range {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .norm-range span,
+    .shutter-range span {
       font-size: 13px;
       color: #cbd5e1;
       font-weight: 700;
@@ -392,10 +399,17 @@
           <button id="hotspotBtn">按钮三（区域温度：关）</button>
           <button id="fullscreenBtn">按钮四（全屏）</button>
           <button id="normModeBtn">按钮五（温度归一化：自适应）</button>
+          <button id="shutterModeBtn">按钮六（快门触发：自动）</button>
+          <button id="shutterTriggerBtn" style="display:none">触发快门</button>
           <div id="normRangeBox" class="norm-range" aria-label="归一化温度范围" style="display:none">
             <span>归一化℃</span>
             <input id="normMinInput" class="num-input" type="text" inputmode="decimal" autocomplete="off" placeholder="最小 -20~120" />
             <input id="normMaxInput" class="num-input" type="text" inputmode="decimal" autocomplete="off" placeholder="最大 -20~120" />
+          </div>
+          <div id="shutterRangeBox" class="shutter-range" aria-label="快门触发间隔范围">
+            <span>快门间隔</span>
+            <input id="shutterMinInput" class="num-input" type="text" inputmode="numeric" autocomplete="off" placeholder="最小 1~120" />
+            <input id="shutterMaxInput" class="num-input" type="text" inputmode="numeric" autocomplete="off" placeholder="最大 1~120" />
           </div>
           <div id="status" class="status">等待操作</div>
         </div>
@@ -472,9 +486,14 @@
     const hotspotBtn = document.getElementById("hotspotBtn");
     const fullscreenBtn = document.getElementById("fullscreenBtn");
     const normModeBtn = document.getElementById("normModeBtn");
+    const shutterModeBtn = document.getElementById("shutterModeBtn");
     const normRangeBox = document.getElementById("normRangeBox");
     const normMinInput = document.getElementById("normMinInput");
     const normMaxInput = document.getElementById("normMaxInput");
+    const shutterTriggerBtn = document.getElementById("shutterTriggerBtn");
+    const shutterRangeBox = document.getElementById("shutterRangeBox");
+    const shutterMinInput = document.getElementById("shutterMinInput");
+    const shutterMaxInput = document.getElementById("shutterMaxInput");
     const statusEl = document.getElementById("status");
     const streamEl = document.getElementById("stream");
     const viewerEl = document.querySelector(".viewer");
@@ -504,7 +523,9 @@
     const pixelCount = THERMAL_W * THERMAL_H;
     const REAL_NORM_C_MIN_LIMIT = -20;
     const REAL_NORM_C_MAX_LIMIT = 120;
-    const REAL_NORM_C_GAP_MIN = 20;
+    const REAL_NORM_C_GAP_MIN = 10;
+    const SHUTTER_INTERVAL_MIN = 1;
+    const SHUTTER_INTERVAL_MAX = 120;
 
     // User-configurable range for "real" normalization mode.
     let realNormMinC = 10;
@@ -552,6 +573,11 @@
     let pseudoFullscreenActive = false;
     let pseudoFsScrollTop = 0;
     let pseudoFsScrollLeft = 0;
+    let shutterDisableAuto = false;
+    let shutterMinInterval = 30;
+    let shutterMaxInterval = 90;
+    let shutterConfigBusy = false;
+    let shutterTriggerBusy = false;
     let xterm = null;
     let fitAddon = null;
     let terminalReadSeq = 0;
@@ -671,6 +697,11 @@
           } else {
             setTerminalStatus("会话未运行", "warn");
           }
+
+          // Avoid hot-loop polling when session is not running.
+          if (!data.running) {
+            await sleep(400);
+          }
         } catch (err) {
           setTerminalStatus(`连接中断：${err.message}`, "err");
           await sleep(500);
@@ -785,13 +816,138 @@
       normMaxInput.disabled = !showRealRangeInputs;
     }
 
+    function updateShutterModeButton() {
+      const modeLabel = shutterDisableAuto ? "手动" : "自动";
+      shutterModeBtn.textContent = `按钮六（快门触发：${modeLabel}）`;
+      const showManualTrigger = shutterDisableAuto;
+      shutterRangeBox.style.display = showManualTrigger ? "none" : "flex";
+      shutterMinInput.disabled = showManualTrigger || shutterConfigBusy;
+      shutterMaxInput.disabled = showManualTrigger || shutterConfigBusy;
+      shutterTriggerBtn.style.display = showManualTrigger ? "inline-flex" : "none";
+      shutterTriggerBtn.disabled = !showManualTrigger || shutterConfigBusy || shutterTriggerBusy;
+    }
+
+    function _parseShutterInt(text) {
+      const s = String(text || "").trim();
+      if (!/^\d+$/.test(s)) return null;
+      const v = Number.parseInt(s, 10);
+      if (!Number.isFinite(v)) return null;
+      return v;
+    }
+
+    function _shutterRangeHint() {
+      return `范围要求：${SHUTTER_INTERVAL_MIN}~${SHUTTER_INTERVAL_MAX} 的整数，且最小值 <= 最大值`;
+    }
+
+    function _validateShutterRanges(minV, maxV, announce = true) {
+      if (minV === null || maxV === null) {
+        if (announce) setStatus(`快门间隔格式不合法：${_shutterRangeHint()}`, "warn");
+        return false;
+      }
+      if (
+        minV < SHUTTER_INTERVAL_MIN || minV > SHUTTER_INTERVAL_MAX ||
+        maxV < SHUTTER_INTERVAL_MIN || maxV > SHUTTER_INTERVAL_MAX
+      ) {
+        if (announce) setStatus(`快门间隔超出范围：${_shutterRangeHint()}`, "warn");
+        return false;
+      }
+      if (minV > maxV) {
+        if (announce) setStatus(`快门间隔不合法：最小值不能大于最大值（当前 ${minV}/${maxV}）`, "warn");
+        return false;
+      }
+      return true;
+    }
+
+    function syncShutterControlsFromScheduler(sched) {
+      if (!sched) return;
+      if (typeof sched.disable_auto === "boolean") {
+        shutterDisableAuto = sched.disable_auto;
+      }
+      if (Number.isInteger(sched.min_interval)) {
+        shutterMinInterval = sched.min_interval;
+      }
+      if (Number.isInteger(sched.max_interval)) {
+        shutterMaxInterval = sched.max_interval;
+      }
+      if (document.activeElement !== shutterMinInput) {
+        shutterMinInput.value = String(shutterMinInterval);
+      }
+      if (document.activeElement !== shutterMaxInput) {
+        shutterMaxInput.value = String(shutterMaxInterval);
+      }
+      updateShutterModeButton();
+    }
+
+    async function applyShutterConfig({
+      disableAuto = null,
+      minInterval = null,
+      maxInterval = null,
+      announce = true,
+    } = {}) {
+      if (shutterConfigBusy) return false;
+
+      const payload = {};
+      if (disableAuto !== null) payload.disable_auto = !!disableAuto;
+      if (minInterval !== null) payload.min_interval = minInterval;
+      if (maxInterval !== null) payload.max_interval = maxInterval;
+      if (Object.keys(payload).length === 0) return false;
+
+      shutterConfigBusy = true;
+      updateShutterModeButton();
+      try {
+        const data = await postJson("/api/shutter/config", payload);
+        const sched = data.shutter_scheduler || {};
+        syncShutterControlsFromScheduler(sched);
+        if (announce) {
+          if (shutterDisableAuto) {
+            setStatus("快门策略已更新：手动（点击“触发快门”执行）", "ok");
+          } else {
+            setStatus(`快门策略已更新：自动，最小/最大=${shutterMinInterval}/${shutterMaxInterval}`, "ok");
+          }
+        }
+        return true;
+      } catch (err) {
+        if (announce) setStatus(`快门策略更新失败：${err.message}`, "warn");
+        return false;
+      } finally {
+        shutterConfigBusy = false;
+        updateShutterModeButton();
+      }
+    }
+
+    async function triggerManualShutter({ announce = true } = {}) {
+      if (shutterTriggerBusy) return false;
+      if (!shutterDisableAuto) {
+        if (announce) setStatus("当前为自动模式，请先切到手动模式再触发快门", "warn");
+        return false;
+      }
+      shutterTriggerBusy = true;
+      updateShutterModeButton();
+      try {
+        const data = await postJson("/api/shutter/trigger", {});
+        const sched = data.shutter_scheduler || {};
+        syncShutterControlsFromScheduler(sched);
+        if (announce) {
+          const countText = Number.isInteger(sched.trigger_count) ? `（累计 ${sched.trigger_count} 次）` : "";
+          setStatus(`手动快门触发成功${countText}`, "ok");
+        }
+        return true;
+      } catch (err) {
+        if (announce) setStatus(`手动快门触发失败：${err.message}`, "warn");
+        return false;
+      } finally {
+        shutterTriggerBusy = false;
+        updateShutterModeButton();
+      }
+    }
+
     function _matchesNumberRegex(s) {
       // Strict numeric string check via regex (supports: -20, 0, 12.5, -0.5)
       return /^-?(?:\d+|\d+\.\d+|\.\d+)$/.test((s || "").trim());
     }
 
     function _fmtRangeHint() {
-      return `范围要求：${REAL_NORM_C_MIN_LIMIT}~${REAL_NORM_C_MAX_LIMIT}，且最大值 - 最小值 > ${REAL_NORM_C_GAP_MIN}`;
+      return `范围要求：${REAL_NORM_C_MIN_LIMIT}~${REAL_NORM_C_MAX_LIMIT}，且最大值 - 最小值 >= ${REAL_NORM_C_GAP_MIN}`;
     }
 
     function validateAndApplyRealNormRange({ announce = true } = {}) {
@@ -815,8 +971,8 @@
         return false;
       }
 
-      if (!(maxC - minC > REAL_NORM_C_GAP_MIN)) {
-        if (announce) setStatus(`温度范围过窄：第二个值必须比第一个值大于 ${REAL_NORM_C_GAP_MIN}°C（当前 ${minC}~${maxC}）`, "warn");
+      if ((maxC - minC) < REAL_NORM_C_GAP_MIN) {
+        if (announce) setStatus(`温度范围过窄：第二个值必须比第一个值至少高 ${REAL_NORM_C_GAP_MIN}°C（当前 ${minC}~${maxC}）`, "warn");
         return false;
       }
 
@@ -1138,6 +1294,9 @@
         mCam.textContent = "未运行";
       }
       mPalette.textContent = paletteDisplayName(activePalette);
+      if (data.shutter_scheduler) {
+        syncShutterControlsFromScheduler(data.shutter_scheduler);
+      }
     }
 
     async function refreshMetrics() {
@@ -1483,6 +1642,55 @@
       });
     }
 
+    function wireShutterInputs() {
+      shutterMinInput.value = String(shutterMinInterval);
+      shutterMaxInput.value = String(shutterMaxInterval);
+      updateShutterModeButton();
+
+      const applyRange = (announce = true) => {
+        if (shutterDisableAuto) {
+          if (announce) setStatus("当前为手动模式，间隔设置仅在自动模式下生效", "warn");
+          return;
+        }
+        const minV = _parseShutterInt(shutterMinInput.value);
+        const maxV = _parseShutterInt(shutterMaxInput.value);
+        if (!_validateShutterRanges(minV, maxV, announce)) return;
+        applyShutterConfig({
+          minInterval: minV,
+          maxInterval: maxV,
+          announce,
+        });
+      };
+
+      shutterModeBtn.addEventListener("click", () => {
+        applyShutterConfig({
+          disableAuto: !shutterDisableAuto,
+          announce: true,
+        });
+      });
+      shutterTriggerBtn.addEventListener("click", () => {
+        triggerManualShutter({ announce: true });
+      });
+
+      shutterMinInput.addEventListener("change", () => applyRange(true));
+      shutterMaxInput.addEventListener("change", () => applyRange(true));
+      shutterMinInput.addEventListener("blur", () => applyRange(false));
+      shutterMaxInput.addEventListener("blur", () => applyRange(false));
+
+      shutterMinInput.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          applyRange(true);
+        }
+      });
+      shutterMaxInput.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          applyRange(true);
+        }
+      });
+    }
+
     fullscreenBtn.addEventListener("click", async () => {
       try {
         if (!isFullscreenNow()) {
@@ -1546,6 +1754,7 @@
     maybeUpdatePaletteUI();
     updateNormModeButton();
     wireNormInputs();
+    wireShutterInputs();
     updateViewportHeightVar();
     updateFullscreenUi();
     startMetricsLoop();

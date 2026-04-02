@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 import argparse
+import base64
+import collections
+import errno
 import glob
 import importlib.util
 import json
 import os
 import re
+import fcntl
+import pty
 import signal
 import shutil
 import stat
+import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 try:
     import numpy as np
@@ -1046,9 +1053,397 @@ class CameraManager:
             return self._latest_frame, self._jpeg_frame_id, self._running
 
 
+class TerminalManager:
+    MAX_OUTPUT_CHARS = 60000
+    DEFAULT_TIMEOUT_SEC = 20.0
+
+    def __init__(self, initial_cwd: str = None):
+        self._lock = threading.Lock()
+        self._cwd = initial_cwd or os.getcwd()
+
+    @staticmethod
+    def _clip_output(text: str, limit: int):
+        if text is None:
+            return ""
+        if len(text) <= limit:
+            return text
+        remain = len(text) - limit
+        return text[:limit] + f"\n\n[output truncated, omitted {remain} chars]"
+
+    @staticmethod
+    def _parse_positive_timeout(raw):
+        try:
+            timeout = float(raw)
+        except Exception:
+            return TerminalManager.DEFAULT_TIMEOUT_SEC
+        if timeout <= 0:
+            return TerminalManager.DEFAULT_TIMEOUT_SEC
+        return min(timeout, 60.0)
+
+    def _resolve_dir(self, target: str):
+        base = os.path.expanduser(target) if target else os.path.expanduser("~")
+        if not os.path.isabs(base):
+            base = os.path.join(self._cwd, base)
+        resolved = os.path.abspath(base)
+        if not os.path.isdir(resolved):
+            return None, f"cd: no such directory: {target if target else '~'}"
+        return resolved, ""
+
+    def execute(self, command: str, timeout_sec: float = None):
+        cmd = (command or "").strip()
+        if not cmd:
+            return {
+                "ok": True,
+                "code": 0,
+                "cwd": self._cwd,
+                "output": "",
+                "message": "empty command",
+            }
+
+        with self._lock:
+            if cmd in ("clear", "cls"):
+                return {"ok": True, "code": 0, "cwd": self._cwd, "output": "", "clear": True}
+
+            if cmd == "cd" or cmd.startswith("cd "):
+                target = cmd[2:].strip()
+                new_cwd, err = self._resolve_dir(target)
+                if new_cwd is None:
+                    return {"ok": False, "code": 1, "cwd": self._cwd, "output": err}
+                self._cwd = new_cwd
+                return {"ok": True, "code": 0, "cwd": self._cwd, "output": ""}
+
+            marker = f"__YOMBIR_CWD_{int(time.time() * 1000)}_{os.getpid()}__"
+            wrapped = f"{cmd}\nprintf '\\n{marker}%s\\n' \"$PWD\""
+            timeout = timeout_sec or self.DEFAULT_TIMEOUT_SEC
+
+            try:
+                proc = subprocess.run(
+                    ["bash", "-lc", wrapped],
+                    cwd=self._cwd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=timeout,
+                    env=os.environ.copy(),
+                )
+                combined = proc.stdout or ""
+                lines = combined.splitlines()
+                next_cwd = None
+                clean_lines = []
+                for line in lines:
+                    if line.startswith(marker):
+                        next_cwd = line[len(marker) :].strip()
+                        continue
+                    clean_lines.append(line)
+                output = "\n".join(clean_lines)
+                output = self._clip_output(output, self.MAX_OUTPUT_CHARS)
+                if next_cwd and os.path.isdir(next_cwd):
+                    self._cwd = next_cwd
+                return {
+                    "ok": proc.returncode == 0,
+                    "code": int(proc.returncode),
+                    "cwd": self._cwd,
+                    "output": output,
+                }
+            except subprocess.TimeoutExpired as exc:
+                out = ""
+                if exc.stdout:
+                    if isinstance(exc.stdout, bytes):
+                        out = exc.stdout.decode("utf-8", errors="replace")
+                    else:
+                        out = str(exc.stdout)
+                clipped = self._clip_output(out, self.MAX_OUTPUT_CHARS)
+                extra = "\n" if clipped else ""
+                return {
+                    "ok": False,
+                    "code": 124,
+                    "cwd": self._cwd,
+                    "output": f"{clipped}{extra}command timed out after {timeout:.1f}s",
+                }
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "code": 500,
+                    "cwd": self._cwd,
+                    "output": f"terminal execution error: {exc}",
+                }
+
+
+class PtyTerminalManager:
+    MAX_BUFFER_BYTES = 1_000_000
+    DEFAULT_TIMEOUT_MS = 25000
+
+    def __init__(self, shell: str = "/bin/bash"):
+        self._shell = shell
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._proc = None
+        self._master_fd = None
+        self._reader_thread = None
+        self._chunks = collections.deque()  # (seq, bytes)
+        self._bytes_total = 0
+        self._seq = 0
+        self._dropped_until_seq = 0
+        self._exit_code = None
+        self._starting = False
+
+    @staticmethod
+    def _safe_cols_rows(cols, rows):
+        try:
+            cols_i = int(cols)
+        except Exception:
+            cols_i = 120
+        try:
+            rows_i = int(rows)
+        except Exception:
+            rows_i = 34
+        cols_i = max(40, min(400, cols_i))
+        rows_i = max(10, min(200, rows_i))
+        return cols_i, rows_i
+
+    @staticmethod
+    def _parse_positive_timeout_ms(raw):
+        try:
+            timeout = int(raw)
+        except Exception:
+            return PtyTerminalManager.DEFAULT_TIMEOUT_MS
+        if timeout <= 0:
+            return PtyTerminalManager.DEFAULT_TIMEOUT_MS
+        return max(100, min(60000, timeout))
+
+    def _is_running_locked(self):
+        return self._proc is not None and self._proc.poll() is None and self._master_fd is not None
+
+    def _append_chunk_locked(self, data: bytes):
+        if not data:
+            return
+        self._seq += 1
+        self._chunks.append((self._seq, data))
+        self._bytes_total += len(data)
+
+        while self._bytes_total > self.MAX_BUFFER_BYTES and self._chunks:
+            old_seq, old_data = self._chunks.popleft()
+            self._bytes_total -= len(old_data)
+            self._dropped_until_seq = max(self._dropped_until_seq, old_seq)
+
+        self._cv.notify_all()
+
+    def _set_winsize_locked(self, cols: int, rows: int):
+        if self._master_fd is None:
+            return
+        try:
+            packed = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ, packed)
+        except Exception:
+            return
+
+    def _reader_loop(self):
+        while True:
+            with self._lock:
+                master_fd = self._master_fd
+                proc = self._proc
+            if master_fd is None:
+                break
+
+            try:
+                data = os.read(master_fd, 4096)
+            except OSError as exc:
+                # EIO indicates the pty slave side is closed (shell exited).
+                if exc.errno in (errno.EIO, errno.EBADF):
+                    break
+                time.sleep(0.02)
+                continue
+
+            if not data:
+                break
+
+            with self._lock:
+                self._append_chunk_locked(data)
+                if proc is not None and proc.poll() is not None:
+                    break
+
+        with self._lock:
+            code = None
+            if self._proc is not None:
+                code = self._proc.poll()
+                if code is None:
+                    try:
+                        self._proc.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        self._proc.wait(timeout=0.5)
+                    except Exception:
+                        pass
+                    code = self._proc.poll()
+
+            self._exit_code = code
+            if self._master_fd is not None:
+                try:
+                    os.close(self._master_fd)
+                except Exception:
+                    pass
+                self._master_fd = None
+            self._proc = None
+            self._reader_thread = None
+            self._cv.notify_all()
+
+    def _start_locked(self, cols: int, rows: int):
+        if self._starting:
+            return
+        self._starting = True
+        try:
+            master_fd, slave_fd = pty.openpty()
+            packed = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, packed)
+
+            env = os.environ.copy()
+            env.setdefault("TERM", "xterm-256color")
+
+            proc = subprocess.Popen(
+                [self._shell, "-il"],
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                start_new_session=True,
+                close_fds=True,
+                cwd=os.getcwd(),
+                env=env,
+            )
+            os.close(slave_fd)
+
+            self._proc = proc
+            self._master_fd = master_fd
+            self._exit_code = None
+            self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+            self._reader_thread.start()
+        finally:
+            self._starting = False
+
+    def start(self, cols=120, rows=34):
+        cols_i, rows_i = self._safe_cols_rows(cols, rows)
+        with self._lock:
+            if self._is_running_locked():
+                self._set_winsize_locked(cols_i, rows_i)
+            else:
+                self._start_locked(cols_i, rows_i)
+            return {
+                "ok": True,
+                "running": self._is_running_locked(),
+                "seq": self._seq,
+                "exit_code": self._exit_code,
+            }
+
+    def stop(self):
+        with self._lock:
+            proc = self._proc
+            master_fd = self._master_fd
+            self._proc = None
+            self._master_fd = None
+            self._reader_thread = None
+            self._exit_code = None
+
+            if master_fd is not None:
+                try:
+                    os.close(master_fd)
+                except Exception:
+                    pass
+
+            if proc is not None and proc.poll() is None:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except Exception:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=1.2)
+                except Exception:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+            self._cv.notify_all()
+            return {"ok": True}
+
+    def resize(self, cols, rows):
+        cols_i, rows_i = self._safe_cols_rows(cols, rows)
+        with self._lock:
+            self._set_winsize_locked(cols_i, rows_i)
+            return {
+                "ok": True,
+                "running": self._is_running_locked(),
+                "cols": cols_i,
+                "rows": rows_i,
+            }
+
+    def write(self, data: str):
+        if data is None:
+            data = ""
+        with self._lock:
+            if not self._is_running_locked():
+                return {"ok": False, "error": "terminal session not running"}
+            master_fd = self._master_fd
+
+        try:
+            payload = data.encode("utf-8", errors="replace")
+            if payload:
+                os.write(master_fd, payload)
+            return {"ok": True, "written": len(payload)}
+        except Exception as exc:
+            return {"ok": False, "error": f"write failed: {exc}"}
+
+    def read(self, after_seq: int, timeout_ms: int):
+        timeout_ms_i = self._parse_positive_timeout_ms(timeout_ms)
+        try:
+            after = int(after_seq)
+        except Exception:
+            after = 0
+
+        deadline = time.time() + (timeout_ms_i / 1000.0)
+        with self._cv:
+            while self._seq <= after and self._is_running_locked():
+                remain = deadline - time.time()
+                if remain <= 0:
+                    break
+                self._cv.wait(timeout=remain)
+
+            dropped = after < self._dropped_until_seq
+            out_parts = []
+            out_bytes = 0
+            next_seq = after
+            for seq, data in self._chunks:
+                if seq <= after:
+                    continue
+                if out_bytes + len(data) > 256000 and out_parts:
+                    break
+                out_parts.append(data)
+                out_bytes += len(data)
+                next_seq = seq
+                if len(out_parts) >= 128:
+                    break
+
+            merged = b"".join(out_parts)
+            payload_b64 = base64.b64encode(merged).decode("ascii") if merged else ""
+            return {
+                "ok": True,
+                "running": self._is_running_locked(),
+                "seq": next_seq,
+                "dropped": dropped,
+                "exit_code": self._exit_code,
+                "data_b64": payload_b64,
+            }
+
+
 class CameraHandler(BaseHTTPRequestHandler):
     manager: CameraManager = None
     metrics: SystemMetricsSampler = None
+    terminal: TerminalManager = None
+    pty_terminal: PtyTerminalManager = None
 
     def _json(self, code: int, payload: dict):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -1060,7 +1455,8 @@ class CameraHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/api/status":
             self._json(200, self.manager.get_status())
             return
@@ -1072,6 +1468,17 @@ class CameraHandler(BaseHTTPRequestHandler):
         if path == "/api/metrics":
             camera_status = self.manager.get_status()
             self._json(200, self.metrics.snapshot(camera_status))
+            return
+
+        if path == "/api/terminal/session/read":
+            if self.pty_terminal is None:
+                self._json(503, {"error": "pty terminal not ready"})
+                return
+            query = parse_qs(parsed.query or "", keep_blank_values=True)
+            after = query.get("after", ["0"])[0]
+            timeout_ms = query.get("timeout_ms", [str(PtyTerminalManager.DEFAULT_TIMEOUT_MS)])[0]
+            result = self.pty_terminal.read(after, timeout_ms)
+            self._json(200, result)
             return
 
         if path == "/frame.raw":
@@ -1177,9 +1584,102 @@ class CameraHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/api/terminal/session/start":
+            if self.pty_terminal is None:
+                self._json(503, {"error": "pty terminal not ready"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except Exception:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8", errors="ignore"))
+            except Exception:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            cols = payload.get("cols", 120)
+            rows = payload.get("rows", 34)
+            self._json(200, self.pty_terminal.start(cols=cols, rows=rows))
+            return
+
+        if path == "/api/terminal/session/stop":
+            if self.pty_terminal is None:
+                self._json(503, {"error": "pty terminal not ready"})
+                return
+            self._json(200, self.pty_terminal.stop())
+            return
+
+        if path == "/api/terminal/session/resize":
+            if self.pty_terminal is None:
+                self._json(503, {"error": "pty terminal not ready"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except Exception:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8", errors="ignore"))
+            except Exception:
+                self._json(400, {"error": "invalid json"})
+                return
+            if not isinstance(payload, dict):
+                self._json(400, {"error": "invalid payload"})
+                return
+            cols = payload.get("cols", 120)
+            rows = payload.get("rows", 34)
+            self._json(200, self.pty_terminal.resize(cols=cols, rows=rows))
+            return
+
+        if path == "/api/terminal/session/write":
+            if self.pty_terminal is None:
+                self._json(503, {"error": "pty terminal not ready"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except Exception:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8", errors="ignore"))
+            except Exception:
+                self._json(400, {"error": "invalid json"})
+                return
+            if not isinstance(payload, dict):
+                self._json(400, {"error": "invalid payload"})
+                return
+            data = payload.get("data", "")
+            self._json(200, self.pty_terminal.write(data))
+            return
+
         if path == "/api/open-camera":
             ok, payload = self.manager.open_camera()
             self._json(200 if ok else 500, payload)
+            return
+        if path == "/api/terminal/exec":
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except Exception:
+                length = 0
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                payload = json.loads(raw.decode("utf-8", errors="ignore"))
+            except Exception:
+                self._json(400, {"error": "invalid json"})
+                return
+            if not isinstance(payload, dict):
+                self._json(400, {"error": "invalid payload"})
+                return
+            if self.terminal is None:
+                self._json(503, {"error": "terminal not ready"})
+                return
+
+            command = payload.get("command", "")
+            timeout = TerminalManager._parse_positive_timeout(payload.get("timeout_sec"))
+            result = self.terminal.execute(command, timeout_sec=timeout)
+            self._json(200, result)
             return
         if path == "/api/palette":
             try:
@@ -1219,8 +1719,12 @@ def main():
     manager = CameraManager()
     camera_vtemp_sampler = CameraVtempSampler()
     metrics = SystemMetricsSampler(camera_vtemp_sampler=camera_vtemp_sampler)
+    terminal = TerminalManager()
+    pty_terminal = PtyTerminalManager()
     CameraHandler.manager = manager
     CameraHandler.metrics = metrics
+    CameraHandler.terminal = terminal
+    CameraHandler.pty_terminal = pty_terminal
     server = ThreadingHTTPServer((args.host, args.port), CameraHandler)
 
     try:
@@ -1228,6 +1732,10 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            pty_terminal.stop()
+        except Exception:
+            pass
         manager.stop()
         server.server_close()
 

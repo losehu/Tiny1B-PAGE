@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>摄像头局域网预览</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
   <style>
     :root {
       --bg: #0f172a;
@@ -223,9 +224,129 @@
       color: #e2e8f0;
       font-variant-numeric: tabular-nums;
     }
+    .terminal-panel {
+      margin-top: 12px;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      overflow: hidden;
+      background: linear-gradient(180deg, rgba(2, 6, 23, 0.78) 0%, rgba(2, 6, 23, 0.94) 100%);
+      box-shadow: inset 0 1px 0 rgba(148, 163, 184, 0.15);
+    }
+    .term-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px 10px;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.28);
+      background: linear-gradient(180deg, rgba(30, 41, 59, 0.75) 0%, rgba(15, 23, 42, 0.75) 100%);
+    }
+    .term-head-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .term-dots {
+      display: inline-flex;
+      gap: 5px;
+      flex: none;
+    }
+    .term-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      border: 1px solid rgba(15, 23, 42, 0.45);
+    }
+    .term-dot.red { background: #ef4444; }
+    .term-dot.yellow { background: #f59e0b; }
+    .term-dot.green { background: #22c55e; }
+    .term-title {
+      font-size: 12px;
+      font-weight: 800;
+      color: #cbd5e1;
+      letter-spacing: 0.3px;
+      white-space: nowrap;
+    }
+    .term-cwd {
+      font-family: "JetBrains Mono", "Fira Code", "SFMono-Regular", Menlo, monospace;
+      font-size: 12px;
+      color: #93c5fd;
+      max-width: 42%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .term-status {
+      font-size: 12px;
+      font-weight: 700;
+      color: #a7f3d0;
+      white-space: nowrap;
+      margin-left: auto;
+      margin-right: 8px;
+    }
+    .term-status.warn {
+      color: #fbbf24;
+    }
+    .term-status.err {
+      color: #fca5a5;
+    }
+    .term-status.ok {
+      color: #86efac;
+    }
+    .term-mount {
+      height: 300px;
+      background: #030712;
+      padding: 6px;
+    }
+    .term-foot {
+      display: grid;
+      grid-template-columns: 1fr auto auto auto;
+      gap: 8px;
+      align-items: center;
+      padding: 8px;
+      border-top: 1px solid rgba(148, 163, 184, 0.24);
+      background: rgba(2, 6, 23, 0.82);
+    }
+    .term-tip {
+      font-family: "JetBrains Mono", "Fira Code", "SFMono-Regular", Menlo, monospace;
+      font-size: 12px;
+      color: #94a3b8;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .term-foot button {
+      font-size: 12px;
+      padding: 7px 10px;
+      border-radius: 8px;
+      font-weight: 700;
+    }
+    .xterm-viewport::-webkit-scrollbar {
+      width: 8px;
+    }
+    .xterm-viewport::-webkit-scrollbar-thumb {
+      background: rgba(148, 163, 184, 0.35);
+      border-radius: 999px;
+    }
     @media (max-width: 920px) {
       .layout {
         grid-template-columns: 1fr;
+      }
+      .term-mount {
+        height: 240px;
+      }
+      .term-foot {
+        grid-template-columns: 1fr 1fr 1fr;
+      }
+      .term-cwd {
+        max-width: 44%;
+      }
+      .term-status {
+        display: none;
+      }
+      .term-tip {
+        grid-column: 1 / -1;
       }
     }
     html.pseudo-fs-lock,
@@ -318,10 +439,33 @@
         <div class="metric-row">
           <span class="metric-k">当前主题</span><span id="mPalette" class="metric-v">--</span>
         </div>
+        <section class="terminal-panel" aria-label="网页终端">
+          <div class="term-head">
+            <div class="term-head-left">
+              <div class="term-dots" aria-hidden="true">
+                <span class="term-dot red"></span>
+                <span class="term-dot yellow"></span>
+                <span class="term-dot green"></span>
+              </div>
+              <span class="term-title">Web Shell</span>
+            </div>
+            <span id="termStatus" class="term-status">连接中…</span>
+            <span id="termCwd" class="term-cwd">--</span>
+          </div>
+          <div id="termMount" class="term-mount"></div>
+          <div class="term-foot">
+            <span class="term-tip">支持全交互命令：vim / top / tmux / Ctrl+C / 方向键 / Tab</span>
+            <button id="termCtrlCBtn" type="button">Ctrl+C</button>
+            <button id="termReconnectBtn" type="button">重连</button>
+            <button id="termRestartBtn" type="button">重启Shell</button>
+          </div>
+        </section>
       </aside>
     </div>
   </main>
 
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
   <script>
     const btn = document.getElementById("openBtn");
     const rotateBtn = document.getElementById("rotateBtn");
@@ -347,6 +491,12 @@
     const mUptime = document.getElementById("mUptime");
     const mCam = document.getElementById("mCam");
     const mPalette = document.getElementById("mPalette");
+    const termMount = document.getElementById("termMount");
+    const termCwd = document.getElementById("termCwd");
+    const termStatus = document.getElementById("termStatus");
+    const termCtrlCBtn = document.getElementById("termCtrlCBtn");
+    const termReconnectBtn = document.getElementById("termReconnectBtn");
+    const termRestartBtn = document.getElementById("termRestartBtn");
 
     const THERMAL_W = 256;
     const THERMAL_H = 192;
@@ -402,6 +552,12 @@
     let pseudoFullscreenActive = false;
     let pseudoFsScrollTop = 0;
     let pseudoFsScrollLeft = 0;
+    let xterm = null;
+    let fitAddon = null;
+    let terminalReadSeq = 0;
+    let terminalReadLoopRunning = false;
+    let terminalWriteBuffer = "";
+    let terminalWriteInFlight = false;
 
     const paletteLabel = {
       yombir: "原始",
@@ -416,6 +572,195 @@
     function setStatus(msg, type = "") {
       statusEl.textContent = msg;
       statusEl.className = "status" + (type ? " " + type : "");
+    }
+
+    function setTerminalStatus(msg, type = "") {
+      termStatus.textContent = msg;
+      termStatus.className = "term-status" + (type ? ` ${type}` : "");
+    }
+
+    function decodeBase64ToUint8Array(b64) {
+      const binary = atob(b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    async function postJson(url, payload) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload || {}),
+      });
+      let data = {};
+      try {
+        data = await res.json();
+      } catch (_) {
+        data = {};
+      }
+      if (!res.ok || data.error) {
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
+      return data;
+    }
+
+    function scheduleTerminalFlush() {
+      if (terminalWriteInFlight || !terminalWriteBuffer) return;
+      terminalWriteInFlight = true;
+      const payload = terminalWriteBuffer;
+      terminalWriteBuffer = "";
+      postJson("/api/terminal/session/write", { data: payload })
+        .catch(() => {
+          terminalWriteBuffer = payload + terminalWriteBuffer;
+          setTerminalStatus("输入发送失败，正在重试…", "warn");
+        })
+        .finally(() => {
+          terminalWriteInFlight = false;
+          if (terminalWriteBuffer) {
+            setTimeout(scheduleTerminalFlush, 15);
+          }
+        });
+    }
+
+    function queueTerminalInput(data) {
+      terminalWriteBuffer += data;
+      scheduleTerminalFlush();
+    }
+
+    async function terminalResize() {
+      if (!xterm || !fitAddon) return;
+      fitAddon.fit();
+      await postJson("/api/terminal/session/resize", {
+        cols: xterm.cols || 120,
+        rows: xterm.rows || 34,
+      }).catch(() => {});
+    }
+
+    async function terminalReadLoop() {
+      if (terminalReadLoopRunning) return;
+      terminalReadLoopRunning = true;
+      setTerminalStatus("已连接", "ok");
+
+      while (terminalReadLoopRunning) {
+        try {
+          const res = await fetch(
+            `/api/terminal/session/read?after=${terminalReadSeq}&timeout_ms=25000&ts=${Date.now()}`,
+            { cache: "no-store", headers: { "Cache-Control": "no-cache" } }
+          );
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+
+          if (data.dropped && xterm) {
+            xterm.writeln("\r\n[终端缓冲区已滚动，已自动跳到最新输出]\r\n");
+          }
+
+          if (data.data_b64 && xterm) {
+            xterm.write(decodeBase64ToUint8Array(data.data_b64));
+          }
+
+          if (typeof data.seq === "number") {
+            terminalReadSeq = data.seq;
+          }
+
+          if (data.running) {
+            setTerminalStatus("已连接", "ok");
+          } else if (data.exit_code !== null && data.exit_code !== undefined) {
+            setTerminalStatus(`Shell已退出(${data.exit_code})`, "warn");
+          } else {
+            setTerminalStatus("会话未运行", "warn");
+          }
+        } catch (err) {
+          setTerminalStatus(`连接中断：${err.message}`, "err");
+          await sleep(500);
+        }
+      }
+    }
+
+    async function startPtyTerminal({ restartShell = false } = {}) {
+      if (!xterm) return;
+
+      if (restartShell) {
+        await postJson("/api/terminal/session/stop", {}).catch(() => {});
+        xterm.reset();
+      }
+
+      const startData = await postJson("/api/terminal/session/start", {
+        cols: xterm.cols || 120,
+        rows: xterm.rows || 34,
+      });
+
+      if (typeof startData.seq === "number") {
+        terminalReadSeq = startData.seq;
+      } else {
+        terminalReadSeq = 0;
+      }
+      termCwd.textContent = "~";
+
+      if (!terminalReadLoopRunning) {
+        terminalReadLoop();
+      }
+    }
+
+    function bootTerminalUi() {
+      if (!window.Terminal || !window.FitAddon || !window.FitAddon.FitAddon) {
+        termMount.innerHTML = '<div style="padding:12px;color:#fca5a5;font-size:13px;">终端依赖加载失败（xterm.js 未就绪）</div>';
+        setTerminalStatus("依赖加载失败", "err");
+        return;
+      }
+
+      xterm = new window.Terminal({
+        cursorBlink: true,
+        convertEol: true,
+        fontFamily: '"JetBrains Mono","Fira Code","SFMono-Regular",Menlo,monospace',
+        fontSize: 12,
+        lineHeight: 1.2,
+        theme: {
+          background: "#030712",
+          foreground: "#d1fae5",
+          cursor: "#34d399",
+          selectionBackground: "rgba(56, 189, 248, 0.25)",
+        },
+        scrollback: 5000,
+        allowProposedApi: false,
+      });
+      fitAddon = new window.FitAddon.FitAddon();
+      xterm.loadAddon(fitAddon);
+      xterm.open(termMount);
+      fitAddon.fit();
+
+      xterm.onData((data) => {
+        queueTerminalInput(data);
+      });
+
+      startPtyTerminal().catch((err) => {
+        setTerminalStatus(`启动失败：${err.message}`, "err");
+      });
+
+      termReconnectBtn.addEventListener("click", () => {
+        setTerminalStatus("重连中…");
+        startPtyTerminal().catch((err) => setTerminalStatus(`重连失败：${err.message}`, "err"));
+      });
+
+      termCtrlCBtn.addEventListener("click", () => {
+        queueTerminalInput("\x03");
+        setTerminalStatus("已发送 Ctrl+C", "ok");
+      });
+
+      termRestartBtn.addEventListener("click", () => {
+        setTerminalStatus("重启中…");
+        startPtyTerminal({ restartShell: true }).catch((err) => setTerminalStatus(`重启失败：${err.message}`, "err"));
+      });
+
+      let resizeTimer = null;
+      window.addEventListener("resize", () => {
+        if (resizeTimer) clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => {
+          terminalResize();
+        }, 120);
+      });
+      setTimeout(() => terminalResize(), 30);
     }
 
     function showStream() {
@@ -1193,6 +1538,7 @@
     window.addEventListener("beforeunload", () => {
       stopMetricsLoop();
       stopLowLatencyPullLoop();
+      terminalReadLoopRunning = false;
       navigator.sendBeacon("/api/stop-camera");
     });
 
@@ -1203,6 +1549,7 @@
     updateViewportHeightVar();
     updateFullscreenUi();
     startMetricsLoop();
+    bootTerminalUi();
   </script>
 </body>
 </html>

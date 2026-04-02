@@ -1,0 +1,1208 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>摄像头局域网预览</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #111827;
+      --line: #334155;
+      --text: #e5e7eb;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --btn: #0ea5e9;
+      --btn-hover: #0284c7;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Noto Sans SC", "Microsoft YaHei", sans-serif;
+      background: radial-gradient(circle at 20% 20%, #1e293b 0%, var(--bg) 45%);
+      color: var(--text);
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+    }
+    .card {
+      width: min(1200px, 100%);
+      background: rgba(17, 24, 39, 0.88);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 18px 45px rgba(0, 0, 0, 0.35);
+    }
+    h1 { margin: 0 0 12px 0; font-size: 24px; }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    button {
+      background: var(--btn);
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      font-size: 16px;
+      font-weight: 700;
+      padding: 10px 16px;
+      cursor: pointer;
+    }
+    button:hover { background: var(--btn-hover); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    input.num-input {
+      background: rgba(2, 6, 23, 0.35);
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 700;
+      padding: 9px 10px;
+      width: 118px;
+      outline: none;
+    }
+    input.num-input::placeholder { color: #94a3b8; font-weight: 600; }
+    input.num-input:focus { border-color: #7dd3fc; }
+    .norm-range {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .norm-range span {
+      font-size: 13px;
+      color: #cbd5e1;
+      font-weight: 700;
+      letter-spacing: 0.2px;
+    }
+    .status {
+      font-size: 14px;
+      color: #cbd5e1;
+      min-height: 20px;
+      word-break: break-all;
+    }
+    .status.ok { color: var(--ok); }
+    .status.warn { color: var(--warn); }
+    .viewer {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      overflow: hidden;
+      background: #000;
+      aspect-ratio: 16 / 9;
+      display: grid;
+      place-items: center;
+      position: relative;
+    }
+    .viewer canvas {
+      max-width: 100%;
+      max-height: 100%;
+      width: auto;
+      height: auto;
+      object-fit: contain;
+      display: none;
+      background: #000;
+      transform-origin: center center;
+      transition: transform 120ms linear;
+      image-rendering: pixelated;
+    }
+    .placeholder {
+      color: #94a3b8;
+      font-size: 14px;
+      padding: 10px;
+      text-align: center;
+    }
+    .viewer-overlay {
+      position: absolute;
+      left: 10px;
+      top: 10px;
+      padding: 4px 8px;
+      border-radius: 8px;
+      font-size: 12px;
+      color: #dbeafe;
+      background: rgba(2, 6, 23, 0.45);
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      pointer-events: none;
+    }
+    .fs-exit-btn {
+      position: absolute;
+      right: 10px;
+      top: 10px;
+      z-index: 5;
+      display: none;
+      padding: 6px 10px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 700;
+      background: rgba(15, 23, 42, 0.85);
+      border: 1px solid rgba(148, 163, 184, 0.45);
+      color: #e2e8f0;
+      cursor: pointer;
+    }
+    .fs-exit-btn:hover {
+      background: rgba(30, 41, 59, 0.9);
+    }
+    .palette-panel {
+      margin-top: 10px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px;
+      background: rgba(2, 6, 23, 0.35);
+    }
+    .palette-title {
+      margin: 0 0 8px 0;
+      font-size: 13px;
+      color: #cbd5e1;
+      letter-spacing: 0.3px;
+    }
+    .palette-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .palette-btn {
+      border: 1px solid #475569;
+      background: #0f172a;
+      color: #e2e8f0;
+      font-size: 13px;
+      border-radius: 999px;
+      padding: 7px 12px;
+      cursor: pointer;
+    }
+    .palette-btn:hover {
+      border-color: #7dd3fc;
+      color: #e0f2fe;
+    }
+    .palette-btn.active {
+      background: #082f49;
+      border-color: #38bdf8;
+      color: #e0f2fe;
+      font-weight: 700;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .left-pane {
+      min-width: 0;
+    }
+    .metrics {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      background: rgba(2, 6, 23, 0.4);
+    }
+    .metrics h2 {
+      margin: 0 0 10px 0;
+      font-size: 18px;
+      color: #bfdbfe;
+    }
+    .metric-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 10px;
+      border-top: 1px dashed #334155;
+      padding: 8px 0;
+      font-size: 14px;
+    }
+    .metric-row:first-of-type {
+      border-top: none;
+      padding-top: 0;
+    }
+    .metric-k {
+      color: #94a3b8;
+    }
+    .metric-v {
+      color: #e2e8f0;
+      font-variant-numeric: tabular-nums;
+    }
+    @media (max-width: 920px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+    }
+    html.pseudo-fs-lock,
+    body.pseudo-fs-lock {
+      height: 100%;
+      overflow: hidden;
+    }
+    .viewer.pseudo-fullscreen {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      width: 100vw;
+      height: calc(var(--app-vh, 1vh) * 100);
+      border: none;
+      border-radius: 0;
+      aspect-ratio: auto;
+      background: #000;
+    }
+    .viewer.pseudo-fullscreen canvas {
+      width: 100%;
+      height: 100%;
+      max-width: none;
+      max-height: none;
+    }
+    .viewer.pseudo-fullscreen .viewer-overlay {
+      top: max(10px, env(safe-area-inset-top));
+      left: max(10px, env(safe-area-inset-left));
+    }
+    .viewer.pseudo-fullscreen .fs-exit-btn {
+      top: max(10px, env(safe-area-inset-top));
+      right: max(10px, env(safe-area-inset-right));
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>局域网摄像头预览</h1>
+    <div class="layout">
+      <section class="left-pane">
+        <div class="toolbar">
+          <button id="openBtn">按钮一（打开摄像头）</button>
+          <button id="rotateBtn">按钮二（旋转90°）</button>
+          <button id="hotspotBtn">按钮三（区域温度：关）</button>
+          <button id="fullscreenBtn">按钮四（全屏）</button>
+          <button id="normModeBtn">按钮五（温度归一化：自适应）</button>
+          <div id="normRangeBox" class="norm-range" aria-label="归一化温度范围" style="display:none">
+            <span>归一化℃</span>
+            <input id="normMinInput" class="num-input" type="text" inputmode="decimal" autocomplete="off" placeholder="最小 -20~120" />
+            <input id="normMaxInput" class="num-input" type="text" inputmode="decimal" autocomplete="off" placeholder="最大 -20~120" />
+          </div>
+          <div id="status" class="status">等待操作</div>
+        </div>
+        <section class="viewer">
+          <canvas id="stream"></canvas>
+          <div id="placeholder" class="placeholder">点击“打开摄像头”后开始实时预览</div>
+          <div id="viewerBadge" class="viewer-overlay">主题: --</div>
+          <button id="fsExitBtn" class="fs-exit-btn">退出全屏</button>
+        </section>
+        <section class="palette-panel">
+          <div class="palette-title">伪彩主题风格</div>
+          <div id="paletteRow" class="palette-row"></div>
+        </section>
+      </section>
+      <aside class="metrics">
+        <h2>实时负载</h2>
+        <div class="metric-row">
+          <span class="metric-k">CPU</span><span id="mCpu" class="metric-v">--</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-k">内存</span><span id="mMem" class="metric-v">--</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-k">系统负载</span><span id="mLoad" class="metric-v">--</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-k">磁盘</span><span id="mDisk" class="metric-v">--</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-k">温度</span><span id="mTemp" class="metric-v">--</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-k">相机Vtemp</span><span id="mCamVtemp" class="metric-v">--</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-k">运行时长</span><span id="mUptime" class="metric-v">--</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-k">摄像头状态</span><span id="mCam" class="metric-v">--</span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-k">当前主题</span><span id="mPalette" class="metric-v">--</span>
+        </div>
+      </aside>
+    </div>
+  </main>
+
+  <script>
+    const btn = document.getElementById("openBtn");
+    const rotateBtn = document.getElementById("rotateBtn");
+    const hotspotBtn = document.getElementById("hotspotBtn");
+    const fullscreenBtn = document.getElementById("fullscreenBtn");
+    const normModeBtn = document.getElementById("normModeBtn");
+    const normRangeBox = document.getElementById("normRangeBox");
+    const normMinInput = document.getElementById("normMinInput");
+    const normMaxInput = document.getElementById("normMaxInput");
+    const statusEl = document.getElementById("status");
+    const streamEl = document.getElementById("stream");
+    const viewerEl = document.querySelector(".viewer");
+    const fsExitBtn = document.getElementById("fsExitBtn");
+    const placeholder = document.getElementById("placeholder");
+    const viewerBadge = document.getElementById("viewerBadge");
+    const paletteRow = document.getElementById("paletteRow");
+    const mCpu = document.getElementById("mCpu");
+    const mMem = document.getElementById("mMem");
+    const mLoad = document.getElementById("mLoad");
+    const mDisk = document.getElementById("mDisk");
+    const mTemp = document.getElementById("mTemp");
+    const mCamVtemp = document.getElementById("mCamVtemp");
+    const mUptime = document.getElementById("mUptime");
+    const mCam = document.getElementById("mCam");
+    const mPalette = document.getElementById("mPalette");
+
+    const THERMAL_W = 256;
+    const THERMAL_H = 192;
+    const THERMAL_BYTES = THERMAL_W * THERMAL_H * 2;
+    const pixelCount = THERMAL_W * THERMAL_H;
+    const REAL_NORM_C_MIN_LIMIT = -20;
+    const REAL_NORM_C_MAX_LIMIT = 120;
+    const REAL_NORM_C_GAP_MIN = 20;
+
+    // User-configurable range for "real" normalization mode.
+    let realNormMinC = 10;
+    let realNormMaxC = 50;
+    let realNormRawMin = Math.round((realNormMinC + 273.15) * 16);
+    let realNormRawRange = Math.max(1, Math.round((realNormMaxC + 273.15) * 16) - realNormRawMin);
+    const REGION_MAX_COUNT = 3;
+    const REGION_RECALC_MS = 160;
+    const MARKER_CANDIDATES = [
+      [255, 255, 255],
+      [0, 0, 0],
+      [255, 255, 0],
+      [0, 255, 255],
+      [255, 0, 255],
+      [255, 80, 80],
+      [80, 255, 80],
+    ];
+    const streamCtx = streamEl.getContext("2d", { alpha: false, desynchronized: true });
+    streamEl.width = THERMAL_W;
+    streamEl.height = THERMAL_H;
+    const frameImageData = streamCtx.createImageData(THERMAL_W, THERMAL_H);
+    const frameRgba = frameImageData.data;
+    const displayRaw16 = new Uint16Array(pixelCount);
+    const bfsQueue = new Int32Array(pixelCount);
+    const visited = new Uint16Array(pixelCount);
+
+    const littleEndian = (() => {
+      const b = new ArrayBuffer(2);
+      new DataView(b).setUint16(0, 0x00ff, true);
+      return new Uint16Array(b)[0] === 0x00ff;
+    })();
+
+    let rotateQuarter = 0;
+    let pullLoopRunning = false;
+    let metricsTimer = null;
+    let activePalette = "iron";
+    const paletteList = ["iron", "rainbow", "white_hot", "black_hot", "arctic", "lava", "yombir"];
+    let paletteUIKey = "";
+    let activeLut = null;
+    let hotspotEnabled = false;
+    let colorNormMode = "adaptive"; // adaptive | real_custom
+    let visitedToken = 1;
+    let lastRegionCalcTs = 0;
+    let cachedHotRegions = [];
+    let pseudoFullscreenActive = false;
+    let pseudoFsScrollTop = 0;
+    let pseudoFsScrollLeft = 0;
+
+    const paletteLabel = {
+      yombir: "原始",
+      iron: "铁红",
+      rainbow: "彩虹",
+      white_hot: "白热",
+      black_hot: "黑热",
+      arctic: "冰蓝",
+      lava: "熔岩",
+    };
+
+    function setStatus(msg, type = "") {
+      statusEl.textContent = msg;
+      statusEl.className = "status" + (type ? " " + type : "");
+    }
+
+    function showStream() {
+      streamEl.style.display = "block";
+      placeholder.style.display = "none";
+    }
+
+    function applyRotation() {
+      const deg = rotateQuarter * 90;
+      streamEl.style.transform = `rotate(${deg}deg)`;
+    }
+
+    function updateNormModeButton() {
+      const label =
+        colorNormMode === "adaptive"
+          ? "自适应"
+          : `真实值${realNormMinC}~${realNormMaxC}°C`;
+      normModeBtn.textContent = `按钮五（温度归一化：${label}）`;
+      const showRealRangeInputs = colorNormMode === "real_custom";
+      normRangeBox.style.display = showRealRangeInputs ? "flex" : "none";
+      normMinInput.disabled = !showRealRangeInputs;
+      normMaxInput.disabled = !showRealRangeInputs;
+    }
+
+    function _matchesNumberRegex(s) {
+      // Strict numeric string check via regex (supports: -20, 0, 12.5, -0.5)
+      return /^-?(?:\d+|\d+\.\d+|\.\d+)$/.test((s || "").trim());
+    }
+
+    function _fmtRangeHint() {
+      return `范围要求：${REAL_NORM_C_MIN_LIMIT}~${REAL_NORM_C_MAX_LIMIT}，且最大值 - 最小值 > ${REAL_NORM_C_GAP_MIN}`;
+    }
+
+    function validateAndApplyRealNormRange({ announce = true } = {}) {
+      const minText = (normMinInput.value || "").trim();
+      const maxText = (normMaxInput.value || "").trim();
+
+      if (!_matchesNumberRegex(minText) || !_matchesNumberRegex(maxText)) {
+        if (announce) setStatus(`温度输入格式不合法（仅数字/小数）：${_fmtRangeHint()}`, "warn");
+        return false;
+      }
+
+      const minC = Number.parseFloat(minText);
+      const maxC = Number.parseFloat(maxText);
+      if (!Number.isFinite(minC) || !Number.isFinite(maxC)) {
+        if (announce) setStatus(`温度输入不是有效数字：${_fmtRangeHint()}`, "warn");
+        return false;
+      }
+
+      if (minC < REAL_NORM_C_MIN_LIMIT || minC > REAL_NORM_C_MAX_LIMIT || maxC < REAL_NORM_C_MIN_LIMIT || maxC > REAL_NORM_C_MAX_LIMIT) {
+        if (announce) setStatus(`温度超出允许范围：${_fmtRangeHint()}`, "warn");
+        return false;
+      }
+
+      if (!(maxC - minC > REAL_NORM_C_GAP_MIN)) {
+        if (announce) setStatus(`温度范围过窄：第二个值必须比第一个值大于 ${REAL_NORM_C_GAP_MIN}°C（当前 ${minC}~${maxC}）`, "warn");
+        return false;
+      }
+
+      // Apply
+      realNormMinC = Math.round(minC * 10) / 10;
+      realNormMaxC = Math.round(maxC * 10) / 10;
+      realNormRawMin = Math.round((realNormMinC + 273.15) * 16);
+      const rawMax = Math.round((realNormMaxC + 273.15) * 16);
+      realNormRawRange = Math.max(1, rawMax - realNormRawMin);
+
+      updateNormModeButton();
+      if (announce) setStatus(`归一化温度范围已更新：${realNormMinC}~${realNormMaxC}°C`, "ok");
+      return true;
+    }
+
+    function mapRawToPaletteIdx(v, minV, maxV) {
+      if (colorNormMode === "real_custom") {
+        const minRaw = realNormRawMin;
+        const maxRaw = minRaw + realNormRawRange;
+        const clamped = v < minRaw ? minRaw : (v > maxRaw ? maxRaw : v);
+        return (((clamped - minRaw) * 255) / realNormRawRange) | 0;
+      }
+      const range = maxV - minV;
+      return range > 0 ? (((v - minV) * 255) / range) | 0 : (v >>> 8);
+    }
+
+    function updateViewportHeightVar() {
+      const vh = window.innerHeight * 0.01;
+      document.documentElement.style.setProperty("--app-vh", `${vh}px`);
+    }
+
+    function isNativeFullscreenNow() {
+      return !!(
+        document.fullscreenElement ||
+        document.webkitFullscreenElement ||
+        document.msFullscreenElement
+      );
+    }
+
+    function isIOSLikeBrowser() {
+      const ua = navigator.userAgent || "";
+      return /iPad|iPhone|iPod/.test(ua) || (ua.includes("Mac") && "ontouchend" in document);
+    }
+
+    function getRequestFullscreenFn(el) {
+      if (!el) return null;
+      return (
+        el.requestFullscreen ||
+        el.webkitRequestFullscreen ||
+        el.webkitRequestFullScreen ||
+        el.msRequestFullscreen ||
+        null
+      );
+    }
+
+    function hasNativeFullscreenApi() {
+      if (isIOSLikeBrowser()) return false;
+      return !!getRequestFullscreenFn(viewerEl);
+    }
+
+    function isFullscreenNow() {
+      return isNativeFullscreenNow() || pseudoFullscreenActive;
+    }
+
+    function updateFullscreenUi() {
+      const fs = isFullscreenNow();
+      fullscreenBtn.textContent = fs ? "按钮四（退出全屏）" : "按钮四（全屏）";
+      fsExitBtn.style.display = fs ? "inline-block" : "none";
+    }
+
+    async function tryLockLandscape() {
+      if (!screen.orientation || !screen.orientation.lock) return;
+      try {
+        await screen.orientation.lock("landscape");
+      } catch (_) {}
+    }
+
+    function tryUnlockOrientation() {
+      if (!screen.orientation || !screen.orientation.unlock) return;
+      try {
+        screen.orientation.unlock();
+      } catch (_) {}
+    }
+
+    async function enterPseudoFullscreen() {
+      if (pseudoFullscreenActive) return;
+      pseudoFsScrollTop = window.scrollY;
+      pseudoFsScrollLeft = window.scrollX;
+      pseudoFullscreenActive = true;
+      document.documentElement.classList.add("pseudo-fs-lock");
+      document.body.classList.add("pseudo-fs-lock");
+      viewerEl.classList.add("pseudo-fullscreen");
+      updateViewportHeightVar();
+      updateFullscreenUi();
+      await tryLockLandscape();
+    }
+
+    async function exitPseudoFullscreen() {
+      if (!pseudoFullscreenActive) return;
+      pseudoFullscreenActive = false;
+      viewerEl.classList.remove("pseudo-fullscreen");
+      document.documentElement.classList.remove("pseudo-fs-lock");
+      document.body.classList.remove("pseudo-fs-lock");
+      tryUnlockOrientation();
+      updateFullscreenUi();
+      window.scrollTo(pseudoFsScrollLeft, pseudoFsScrollTop);
+    }
+
+    async function enterFullscreenLike() {
+      if (hasNativeFullscreenApi()) {
+        try {
+          const ok = await requestViewerFullscreen();
+          if (ok) return "native";
+        } catch (_) {}
+      }
+      await enterPseudoFullscreen();
+      return "pseudo";
+    }
+
+    async function exitFullscreenLike() {
+      if (isNativeFullscreenNow()) {
+        await exitFullscreenSafe();
+      }
+      if (pseudoFullscreenActive) {
+        await exitPseudoFullscreen();
+      }
+    }
+
+    async function requestViewerFullscreen() {
+      const fn = getRequestFullscreenFn(viewerEl);
+      if (!fn) return false;
+      await fn.call(viewerEl);
+      await sleep(0);
+      return isNativeFullscreenNow();
+    }
+
+    async function exitFullscreenSafe() {
+      const fn =
+        document.exitFullscreen ||
+        document.webkitExitFullscreen ||
+        document.msExitFullscreen ||
+        null;
+      if (!fn) return false;
+      await fn.call(document);
+      return true;
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function fmtNum(v, digits = 1) {
+      if (v === null || v === undefined || Number.isNaN(v)) return "--";
+      return Number(v).toFixed(digits);
+    }
+
+    function clampU8(v) {
+      if (v < 0) return 0;
+      if (v > 255) return 255;
+      return (v + 0.5) | 0;
+    }
+
+    function buildLutFromStops(stops) {
+      const lut = new Uint8Array(256 * 3);
+      const sorted = stops.slice().sort((a, b) => a[0] - b[0]);
+      if (sorted[0][0] > 0) sorted.unshift([0, sorted[0][1]]);
+      if (sorted[sorted.length - 1][0] < 1) sorted.push([1, sorted[sorted.length - 1][1]]);
+
+      let seg = 0;
+      for (let i = 0; i < 256; i++) {
+        const p = i / 255;
+        while (seg + 1 < sorted.length && p > sorted[seg + 1][0]) seg++;
+        const [p0, c0] = sorted[seg];
+        const [p1, c1] = sorted[Math.min(seg + 1, sorted.length - 1)];
+        const t = p1 <= p0 ? 0 : (p - p0) / (p1 - p0);
+
+        const r = clampU8(c0[0] + (c1[0] - c0[0]) * t);
+        const g = clampU8(c0[1] + (c1[1] - c0[1]) * t);
+        const b = clampU8(c0[2] + (c1[2] - c0[2]) * t);
+        const j = i * 3;
+        lut[j] = r;
+        lut[j + 1] = g;
+        lut[j + 2] = b;
+      }
+      return lut;
+    }
+
+    const paletteLutMap = {
+      yombir: buildLutFromStops([
+        [0.00, [0, 0, 0]],
+        [0.15, [30, 0, 60]],
+        [0.35, [120, 0, 20]],
+        [0.60, [220, 70, 0]],
+        [0.80, [255, 190, 20]],
+        [1.00, [255, 255, 255]],
+      ]),
+      iron: buildLutFromStops([
+        [0.00, [0, 0, 0]],
+        [0.15, [30, 0, 60]],
+        [0.35, [120, 0, 20]],
+        [0.60, [220, 70, 0]],
+        [0.80, [255, 190, 20]],
+        [1.00, [255, 255, 255]],
+      ]),
+      rainbow: buildLutFromStops([
+        [0.00, [0, 0, 40]],
+        [0.18, [0, 50, 220]],
+        [0.40, [0, 220, 255]],
+        [0.62, [0, 230, 0]],
+        [0.80, [255, 230, 0]],
+        [0.92, [255, 90, 0]],
+        [1.00, [255, 255, 255]],
+      ]),
+      white_hot: buildLutFromStops([
+        [0.00, [0, 0, 0]],
+        [1.00, [255, 255, 255]],
+      ]),
+      black_hot: buildLutFromStops([
+        [0.00, [255, 255, 255]],
+        [1.00, [0, 0, 0]],
+      ]),
+      arctic: buildLutFromStops([
+        [0.00, [0, 0, 0]],
+        [0.25, [0, 30, 120]],
+        [0.55, [0, 130, 255]],
+        [0.80, [120, 220, 255]],
+        [1.00, [255, 255, 255]],
+      ]),
+      lava: buildLutFromStops([
+        [0.00, [0, 0, 0]],
+        [0.25, [80, 0, 0]],
+        [0.50, [180, 10, 0]],
+        [0.75, [255, 90, 0]],
+        [0.92, [255, 180, 40]],
+        [1.00, [255, 250, 210]],
+      ]),
+    };
+
+    function paletteDisplayName(name) {
+      if (!name) return "--";
+      return paletteLabel[name] || name;
+    }
+
+    function updatePaletteUI() {
+      viewerBadge.textContent = `主题: ${paletteDisplayName(activePalette)}`;
+      mPalette.textContent = paletteDisplayName(activePalette);
+      paletteRow.innerHTML = "";
+      for (const p of paletteList) {
+        const b = document.createElement("button");
+        b.className = "palette-btn" + (p === activePalette ? " active" : "");
+        b.textContent = paletteDisplayName(p);
+        b.addEventListener("click", () => setPalette(p, true));
+        paletteRow.appendChild(b);
+      }
+    }
+
+    function maybeUpdatePaletteUI() {
+      const key = `${activePalette}|${paletteList.join(",")}`;
+      if (key === paletteUIKey) return;
+      paletteUIKey = key;
+      updatePaletteUI();
+    }
+
+    function setPalette(name, report = false) {
+      if (!name || !paletteLutMap[name] || name === activePalette) return;
+      activePalette = name;
+      activeLut = paletteLutMap[name];
+      maybeUpdatePaletteUI();
+      if (report) setStatus(`主题已切换：${paletteDisplayName(activePalette)}`, "ok");
+    }
+
+    function fmtUptime(sec) {
+      if (sec === null || sec === undefined) return "--";
+      const d = Math.floor(sec / 86400);
+      const h = Math.floor((sec % 86400) / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = Math.floor(sec % 60);
+      if (d > 0) return `${d}d ${h}h ${m}m`;
+      if (h > 0) return `${h}h ${m}m ${s}s`;
+      return `${m}m ${s}s`;
+    }
+
+    function renderMetrics(data) {
+      mCpu.textContent = `${fmtNum(data.cpu_percent)}%`;
+      if (data.memory) {
+        mMem.textContent = `${fmtNum(data.memory.percent)}% (${fmtNum(data.memory.used_mb, 0)}/${fmtNum(data.memory.total_mb, 0)} MB)`;
+      } else {
+        mMem.textContent = "--";
+      }
+      if (Array.isArray(data.load_avg)) {
+        mLoad.textContent = data.load_avg.map((v) => fmtNum(v, 2)).join(" / ");
+      } else {
+        mLoad.textContent = "--";
+      }
+      if (data.disk) {
+        mDisk.textContent = `${fmtNum(data.disk.percent)}% (${fmtNum(data.disk.used_gb, 1)}/${fmtNum(data.disk.total_gb, 1)} GB)`;
+      } else {
+        mDisk.textContent = "--";
+      }
+      mTemp.textContent = data.temperature_c == null ? "--" : `${fmtNum(data.temperature_c)}°C`;
+
+      const camVtemp = data.camera_vtemp;
+      if (camVtemp && camVtemp.ok && camVtemp.raw_u16 != null) {
+        const age = camVtemp.sample_age_sec == null ? "" : ` (${fmtNum(camVtemp.sample_age_sec, 1)}s)`;
+        mCamVtemp.textContent = `${camVtemp.raw_u16}${age}`;
+      } else if (camVtemp && camVtemp.state === "camera_not_running") {
+        mCamVtemp.textContent = "--";
+      } else if (camVtemp && camVtemp.error) {
+        mCamVtemp.textContent = `读取失败`;
+      } else {
+        mCamVtemp.textContent = "--";
+      }
+
+      mUptime.textContent = fmtUptime(data.uptime_sec);
+      if (data.camera && data.camera.running) {
+        const dev = data.camera.device || "";
+        mCam.textContent = `运行中 ${dev}`.trim();
+      } else {
+        mCam.textContent = "未运行";
+      }
+      mPalette.textContent = paletteDisplayName(activePalette);
+    }
+
+    async function refreshMetrics() {
+      try {
+        const res = await fetch(`/api/metrics?ts=${Date.now()}`, {
+          cache: "no-store",
+          headers: { "Cache-Control": "no-cache" },
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        renderMetrics(data);
+      } catch (_) {
+        mCam.textContent = "指标获取失败";
+      }
+    }
+
+    function startMetricsLoop() {
+      if (metricsTimer) return;
+      refreshMetrics();
+      metricsTimer = setInterval(refreshMetrics, 1500);
+    }
+
+    function stopMetricsLoop() {
+      if (metricsTimer) {
+        clearInterval(metricsTimer);
+        metricsTimer = null;
+      }
+    }
+
+    function nextVisitedToken() {
+      visitedToken += 1;
+      if (visitedToken >= 65535) {
+        visited.fill(0);
+        visitedToken = 1;
+      }
+    }
+
+    function detectHotRegions(minV, maxV) {
+      const range = maxV - minV;
+      if (range <= 0) return [];
+
+      // Adaptive threshold: keep higher-temperature structures, suppress noise.
+      const hotThreshold = minV + Math.max(48, Math.floor(range * 0.72));
+      nextVisitedToken();
+
+      const allRegions = [];
+
+      for (let start = 0; start < pixelCount; start++) {
+        if (visited[start] === visitedToken) continue;
+        if (displayRaw16[start] < hotThreshold) continue;
+
+        let head = 0;
+        let tail = 0;
+        bfsQueue[tail++] = start;
+        visited[start] = visitedToken;
+
+        let area = 0;
+        let maxRaw = -1;
+        let maxIdx = start;
+        let minX = THERMAL_W;
+        let minY = THERMAL_H;
+        let maxX = 0;
+        let maxY = 0;
+
+        while (head < tail) {
+          const idx = bfsQueue[head++];
+          area += 1;
+
+          const x = idx % THERMAL_W;
+          const y = (idx / THERMAL_W) | 0;
+          const raw = displayRaw16[idx];
+
+          if (raw > maxRaw) {
+            maxRaw = raw;
+            maxIdx = idx;
+          }
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+
+          const x0 = x > 0 ? x - 1 : x;
+          const x1 = x < THERMAL_W - 1 ? x + 1 : x;
+          const y0 = y > 0 ? y - 1 : y;
+          const y1 = y < THERMAL_H - 1 ? y + 1 : y;
+
+          for (let ny = y0; ny <= y1; ny++) {
+            const row = ny * THERMAL_W;
+            for (let nx = x0; nx <= x1; nx++) {
+              const nidx = row + nx;
+              if (visited[nidx] === visitedToken) continue;
+              if (displayRaw16[nidx] < hotThreshold) continue;
+              visited[nidx] = visitedToken;
+              bfsQueue[tail++] = nidx;
+            }
+          }
+        }
+
+        const tempC = (maxRaw / 16.0) - 273.15;
+        allRegions.push({ area, maxRaw, maxIdx, minX, minY, maxX, maxY, tempC });
+      }
+
+      if (allRegions.length === 0) return [];
+
+      // Prefer meaningful connected components; fallback to smaller blobs if needed.
+      let regions = allRegions.filter((r) => r.area >= 18);
+      if (regions.length === 0) regions = allRegions.filter((r) => r.area >= 8);
+      if (regions.length === 0) regions = allRegions;
+
+      regions.sort((a, b) => {
+        if (b.maxRaw !== a.maxRaw) return b.maxRaw - a.maxRaw;
+        return b.area - a.area;
+      });
+
+      return regions.slice(0, REGION_MAX_COUNT);
+    }
+
+    function pickContrastColorAt(x, y) {
+      let sr = 0, sg = 0, sb = 0, cnt = 0;
+      const x0 = Math.max(0, x - 1);
+      const x1 = Math.min(THERMAL_W - 1, x + 1);
+      const y0 = Math.max(0, y - 1);
+      const y1 = Math.min(THERMAL_H - 1, y + 1);
+
+      for (let ny = y0; ny <= y1; ny++) {
+        const row = ny * THERMAL_W;
+        for (let nx = x0; nx <= x1; nx++) {
+          const o = (row + nx) * 4;
+          sr += frameRgba[o];
+          sg += frameRgba[o + 1];
+          sb += frameRgba[o + 2];
+          cnt += 1;
+        }
+      }
+
+      const ar = cnt > 0 ? (sr / cnt) : 0;
+      const ag = cnt > 0 ? (sg / cnt) : 0;
+      const ab = cnt > 0 ? (sb / cnt) : 0;
+
+      let best = MARKER_CANDIDATES[0];
+      let bestD = -1;
+      for (const c of MARKER_CANDIDATES) {
+        const dr = c[0] - ar;
+        const dg = c[1] - ag;
+        const db = c[2] - ab;
+        const d = dr * dr + dg * dg + db * db;
+        if (d > bestD) {
+          bestD = d;
+          best = c;
+        }
+      }
+
+      const lum = 0.299 * best[0] + 0.587 * best[1] + 0.114 * best[2];
+      const stroke = lum > 140 ? "rgba(0,0,0,0.9)" : "rgba(255,255,255,0.95)";
+      return {
+        fill: `rgb(${best[0]},${best[1]},${best[2]})`,
+        stroke,
+      };
+    }
+
+    function drawHotRegions(regions) {
+      if (!regions || regions.length === 0) return;
+
+      streamCtx.save();
+      streamCtx.font = "10px sans-serif";
+      streamCtx.lineWidth = 1.2;
+      streamCtx.textBaseline = "middle";
+      streamCtx.lineJoin = "round";
+
+      for (let i = 0; i < regions.length; i++) {
+        const r = regions[i];
+        const hx = r.maxIdx % THERMAL_W;
+        const hy = (r.maxIdx / THERMAL_W) | 0;
+        const label = Number.isFinite(r.tempC) ? `${r.tempC.toFixed(1)}°C` : `--.-°C`;
+        const c = pickContrastColorAt(hx, hy);
+
+        streamCtx.fillStyle = c.fill;
+        streamCtx.strokeStyle = c.stroke;
+        streamCtx.lineWidth = 1.1;
+        streamCtx.beginPath();
+        streamCtx.arc(hx, hy, 2.1, 0, Math.PI * 2);
+        streamCtx.fill();
+        streamCtx.stroke();
+
+        const tx = Math.min(Math.max(hx + 6, 2), THERMAL_W - 72);
+        const ty = Math.min(Math.max(hy - 8, 8), THERMAL_H - 8);
+        streamCtx.strokeStyle = c.stroke;
+        streamCtx.lineWidth = 2.2;
+        streamCtx.strokeText(label, tx, ty);
+        streamCtx.fillStyle = c.fill;
+        streamCtx.fillText(label, tx, ty);
+      }
+
+      streamCtx.restore();
+    }
+
+    function renderRawFrame(arrayBuffer) {
+      if (!arrayBuffer || arrayBuffer.byteLength !== THERMAL_BYTES) {
+        throw new Error(`invalid raw frame size: ${arrayBuffer ? arrayBuffer.byteLength : 0}`);
+      }
+
+      const values = littleEndian ? new Uint16Array(arrayBuffer) : null;
+      const dv = littleEndian ? null : new DataView(arrayBuffer);
+      let minV = 65535;
+      let maxV = 0;
+
+      for (let i = 0; i < pixelCount; i++) {
+        const src = pixelCount - 1 - i; // match yombir default rotate180
+        const v = littleEndian ? values[src] : dv.getUint16(src * 2, true);
+        displayRaw16[i] = v;
+        if (v < minV) minV = v;
+        if (v > maxV) maxV = v;
+      }
+
+      for (let i = 0; i < pixelCount; i++) {
+        const v = displayRaw16[i];
+        const idx = mapRawToPaletteIdx(v, minV, maxV);
+        const p = idx * 3;
+        const o = i * 4;
+        frameRgba[o] = activeLut[p];
+        frameRgba[o + 1] = activeLut[p + 1];
+        frameRgba[o + 2] = activeLut[p + 2];
+        frameRgba[o + 3] = 255;
+      }
+
+      streamCtx.putImageData(frameImageData, 0, 0);
+
+      if (hotspotEnabled) {
+        const now = performance.now();
+        if ((now - lastRegionCalcTs) >= REGION_RECALC_MS || cachedHotRegions.length === 0) {
+          cachedHotRegions = detectHotRegions(minV, maxV);
+          lastRegionCalcTs = now;
+        }
+        drawHotRegions(cachedHotRegions);
+      }
+
+      showStream();
+      applyRotation();
+    }
+
+    async function startLowLatencyPullLoop() {
+      if (pullLoopRunning) return;
+      pullLoopRunning = true;
+
+      while (pullLoopRunning) {
+        try {
+          const res = await fetch(`/frame.raw?ts=${Date.now()}`, {
+            cache: "no-store",
+            headers: { "Cache-Control": "no-cache" },
+          });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const raw = await res.arrayBuffer();
+          renderRawFrame(raw);
+          await sleep(5);
+        } catch (err) {
+          setStatus(`低延时拉流中断：${err.message}`, "warn");
+          await sleep(120);
+        }
+      }
+    }
+
+    function stopLowLatencyPullLoop() {
+      pullLoopRunning = false;
+    }
+
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      setStatus("正在自动查找摄像头并启动...", "warn");
+      try {
+        const res = await fetch("/api/open-camera", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "打开失败");
+        setStatus(`摄像头已打开：${data.device}`, "ok");
+        stopLowLatencyPullLoop();
+        startLowLatencyPullLoop();
+      } catch (err) {
+        setStatus(`未找到或无法打开摄像头：${err.message}`, "warn");
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    rotateBtn.addEventListener("click", () => {
+      rotateQuarter = (rotateQuarter + 1) % 4;
+      applyRotation();
+      setStatus(`旋转角度：${rotateQuarter * 90}°`, "ok");
+    });
+
+    hotspotBtn.addEventListener("click", () => {
+      hotspotEnabled = !hotspotEnabled;
+      hotspotBtn.textContent = `按钮三（区域温度：${hotspotEnabled ? "开" : "关"}）`;
+      cachedHotRegions = [];
+      setStatus(`区域温度显示已${hotspotEnabled ? "开启" : "关闭"}（最多3个连通区域）`, "ok");
+    });
+
+    normModeBtn.addEventListener("click", () => {
+      if (colorNormMode === "adaptive") {
+        // Enter real-value normalization only when inputs are valid.
+        const ok = validateAndApplyRealNormRange({ announce: true });
+        if (!ok) return;
+        colorNormMode = "real_custom";
+      } else {
+        colorNormMode = "adaptive";
+      }
+      updateNormModeButton();
+      if (colorNormMode === "adaptive") {
+        setStatus("温度归一化已切换：自适应（按当前画面动态拉伸）", "ok");
+      } else {
+        const ok = validateAndApplyRealNormRange({ announce: false });
+        if (ok) {
+          setStatus(`温度归一化已切换：真实值${realNormMinC}~${realNormMaxC}°C`, "ok");
+        } else {
+          setStatus(`温度归一化已切换：真实值（输入未通过校验，沿用上次有效范围 ${realNormMinC}~${realNormMaxC}°C）`, "warn");
+        }
+      }
+    });
+
+    function wireNormInputs() {
+      // Defaults shown to user.
+      normMinInput.value = String(realNormMinC);
+      normMaxInput.value = String(realNormMaxC);
+
+      const apply = () => {
+        // Apply immediately; if currently in real mode, it will affect next frames.
+        validateAndApplyRealNormRange({ announce: true });
+      };
+
+      normMinInput.addEventListener("change", apply);
+      normMaxInput.addEventListener("change", apply);
+      normMinInput.addEventListener("blur", () => validateAndApplyRealNormRange({ announce: false }));
+      normMaxInput.addEventListener("blur", () => validateAndApplyRealNormRange({ announce: false }));
+      normMinInput.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          apply();
+        }
+      });
+      normMaxInput.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          apply();
+        }
+      });
+    }
+
+    fullscreenBtn.addEventListener("click", async () => {
+      try {
+        if (!isFullscreenNow()) {
+          const mode = await enterFullscreenLike();
+          if (mode === "native") {
+            setStatus("已进入全屏", "ok");
+          } else {
+            setStatus("已进入网页全屏（兼容模式）", "ok");
+          }
+        } else {
+          await exitFullscreenLike();
+          setStatus("已退出全屏", "ok");
+        }
+      } catch (err) {
+        setStatus(`全屏切换失败：${err.message}`, "warn");
+      }
+    });
+
+    fsExitBtn.addEventListener("click", async () => {
+      try {
+        if (isFullscreenNow()) {
+          await exitFullscreenLike();
+          setStatus("已退出全屏", "ok");
+        }
+      } catch (err) {
+        setStatus(`退出全屏失败：${err.message}`, "warn");
+      }
+    });
+
+    viewerEl.addEventListener("dblclick", async () => {
+      try {
+        if (isFullscreenNow()) {
+          await exitFullscreenLike();
+          setStatus("已退出全屏", "ok");
+        }
+      } catch (_) {}
+    });
+
+    document.addEventListener("keydown", async (ev) => {
+      if (ev.key !== "Escape") return;
+      if (!isFullscreenNow()) return;
+      try {
+        await exitFullscreenLike();
+      } catch (_) {}
+    });
+
+    document.addEventListener("fullscreenchange", updateFullscreenUi);
+    document.addEventListener("webkitfullscreenchange", updateFullscreenUi);
+    document.addEventListener("MSFullscreenChange", updateFullscreenUi);
+    window.addEventListener("resize", updateViewportHeightVar);
+    window.addEventListener("orientationchange", updateViewportHeightVar);
+
+    window.addEventListener("beforeunload", () => {
+      stopMetricsLoop();
+      stopLowLatencyPullLoop();
+      navigator.sendBeacon("/api/stop-camera");
+    });
+
+    activeLut = paletteLutMap[activePalette];
+    maybeUpdatePaletteUI();
+    updateNormModeButton();
+    wireNormInputs();
+    updateViewportHeightVar();
+    updateFullscreenUi();
+    startMetricsLoop();
+  </script>
+</body>
+</html>

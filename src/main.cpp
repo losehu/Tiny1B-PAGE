@@ -24,6 +24,8 @@
 #include <string.h>
 #include <signal.h>
 #include <inttypes.h>
+#include <time.h>
+#include <stdlib.h>
 
 #include <logger.h>
 #include <V4l2Capture.h>
@@ -31,6 +33,7 @@
 #include <opencv2/core/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/highgui/highgui.hpp>
+#include <opencv2/videoio.hpp>
 
 // Defines
 
@@ -78,23 +81,24 @@ struct VideoCaptureParams {
 bool terminate = false;
 
 VideoCaptureParams captureParams;
-V4l2Capture *videoCapture;
+V4l2Capture *videoCapture = NULL;
 
 int thermalImage16leSizeBytes;
-uint16_t *captureBuffer;
-uint16_t *thermalImage16le;
-uint8_t *thermalImageRGB;
+uint16_t *captureBuffer = NULL;
+uint16_t *thermalImage16le = NULL;
+uint8_t *thermalImageRGB = NULL;
 
 bool rotate90 = false;
 bool rotate180 = true;
+bool headlessRecord5s = false;
 
 int displayWidth;
 int displayHeight;
 int displaySizeBytes;
-uint8_t *frameBufferRGB;
+uint8_t *frameBufferRGB = NULL;
 
 const int gradientWidth = 1 << 16;
-uint8_t *gradientRGB;
+uint8_t *gradientRGB = NULL;
 
 cv::Mat iconPause;
 cv::Mat iconRecord;
@@ -116,8 +120,9 @@ void closeVideoCapture();
 
 bool processFrame( std::string &error );
 void convertThermalGray16LEToRGB( int width, int height, const uint16_t *frameContents, uint8_t *dest, uint8_t *gradientRGB, bool rotate );
+void convertThermalGray16LENormalizedToRGB( int width, int height, const uint16_t *frameContents, uint8_t *dest, uint8_t *gradientRGB, bool rotate );
 
-bool initGraphics( std::string &error );
+bool initGraphics( std::string &error, bool enableDisplay );
 void repaint();
 void processKey( int key );
 void finishGraphics();
@@ -128,6 +133,14 @@ void stopRecording();
 void toggleRecording();
 void recordFrame();
 
+std::string getOutputDirectory();
+std::string buildHeadlessOutputFilePath();
+bool recordHeadless5Seconds( std::string &error, std::string &outputPath );
+void getFrameMinMax( const uint16_t *frameContents, int pixelCount, uint16_t &minValue, uint16_t &maxValue );
+const uint16_t *selectBestThermalPlane( const uint16_t *captureBuffer, int pixelCount );
+std::string shellQuote( std::string text );
+bool transcodeToVscodeMp4( std::string inputPath, std::string outputPath, std::string &error );
+
 
 // Functions
 
@@ -135,18 +148,35 @@ int main( int argc, char** argv ) {
 
 	signal( SIGTERM, signalHandler );
 	signal( SIGINT, signalHandler );
-
+	
 	// Parse parameters
-	if ( argc > 3 ) printErrorAndExit( std::string( "" ) );
 	std::string devicePath = std::string( "/dev/video0" );
-	if ( argc >= 2 ) devicePath = std::string( argv[ 1 ] );
-	if ( argc >= 3 && argv[ 2 ][ 0 ] == 'r' && argv[ 2 ][ 1 ] == '9' && argv[ 2 ][ 2 ] == 0 )  rotate90 = true;
-	else if ( argc >= 3 && argv[ 2 ][ 0 ] == 'r' && argv[ 2 ][ 1 ] == 0 )  rotate180 = false;
-
+	bool devicePathSet = false;
+	for ( int i = 1; i < argc; i ++ ) {
+		std::string arg = std::string( argv[ i ] );
+		if ( arg == "r9" ) rotate90 = true;
+		else if ( arg == "r" ) rotate180 = false;
+		else if ( arg == "h5" || arg == "--headless-5s" ) headlessRecord5s = true;
+		else if ( ! devicePathSet ) {
+			devicePath = arg;
+			devicePathSet = true;
+		}
+		else printErrorAndExit( std::string( "" ) );
+	}
+	std::cout<<"start!"<<std::endl;
 	std::string error;
 
 	if ( ! initVideoCapture( devicePath, error ) ) printErrorAndExit( error );
-	if ( ! initGraphics( error ) ) printErrorAndExit( error );
+	if ( ! initGraphics( error, ! headlessRecord5s ) ) printErrorAndExit( error );
+
+	if ( headlessRecord5s ) {
+		std::string outputPath;
+		if ( ! recordHeadless5Seconds( error, outputPath ) ) printErrorAndExit( error );
+		printf( "Saved 5-second MP4 to '%s'\n", outputPath.c_str() );
+		finishGraphics();
+		closeVideoCapture();
+		return 0;
+	}
 
 	const int waitMilliseconds = floor( 1000.0f / 60.0 );
 
@@ -181,7 +211,14 @@ void signalHandler( int ) {
 
 void printErrorAndExit( std::string error ) {
 	printf( "\n%s\n", error.c_str() );
-	printf( "\nUsage: ./yombir [video device path] [r[9]]\n    (Default device: /dev/video0)\n    r = rotate screen 180º, r9 = rotate 90º (only for realtime display, not\n    on recorded files) \n\n");
+	printf(
+		"\nUsage: ./yombir [video device path] [r] [r9] [h5|--headless-5s]\n"
+		"    (Default device: /dev/video0)\n"
+		"    r = rotate screen 180º, r9 = rotate 90º (only for realtime display, not\n"
+		"    on recorded files)\n"
+		"    h5|--headless-5s = do not open a window, record 5 seconds directly to MP4\n"
+		"    in the caller current directory.\n\n"
+	);
 	exit( -1 );
 }
 
@@ -291,6 +328,7 @@ void closeVideoCapture() {
 	if ( videoCapture ) delete videoCapture;
 
 	delete [] captureBuffer;
+	delete [] thermalImageRGB;
 
 }
 
@@ -321,7 +359,51 @@ void convertThermalGray16LEToRGB( int width, int height, const uint16_t *frameCo
 
 }
 
-bool initGraphics( std::string &error ) {
+void convertThermalGray16LENormalizedToRGB( int width, int height, const uint16_t *frameContents, uint8_t *dest, uint8_t *gradientRGB, bool rotate ) {
+
+	const int n = width * height;
+	uint16_t minValue = UINT16_MAX;
+	uint16_t maxValue = 0;
+
+	for ( int i = 0; i < n; i ++ ) {
+		const int ir = rotate ? n - 1 - i : i;
+		const uint16_t gray = frameContents[ ir ];
+		if ( gray < minValue ) minValue = gray;
+		if ( gray > maxValue ) maxValue = gray;
+	}
+
+	const uint32_t range = (uint32_t)maxValue - (uint32_t)minValue;
+	for ( int i = 0; i < n; i ++ ) {
+
+		const int ir = rotate ? n - 1 - i : i;
+		const uint16_t gray = frameContents[ ir ];
+		uint16_t normalized = gray;
+		if ( range > 0 ) {
+			normalized = (uint16_t)( ((uint32_t)( gray - minValue ) * 65535U ) / range );
+		}
+
+		const int p = ((int)normalized) * 3;
+		*dest ++ = gradientRGB[ p + 2 ];
+		*dest ++ = gradientRGB[ p + 1 ];
+		*dest ++ = gradientRGB[ p + 0 ];
+
+	}
+
+}
+
+bool initGraphics( std::string &error, bool enableDisplay ) {
+
+	// Load gradient file (needed for both display and headless recording)
+	gradientRGB = new uint8_t[ gradientWidth * 3 ];
+	FILE *f = fopen( "../gradients/gradient.bin", "r+" );
+	if ( ! f || fread( gradientRGB, gradientWidth * 3, 1, f ) != 1 ) {
+		if ( f ) fclose( f );
+		error = "Couldn't load '../gradients/gradient.bin.'";
+		return false;
+	}
+	fclose( f );
+
+	if ( ! enableDisplay ) return true;
 
 	// Get screen resolution from config
 
@@ -355,17 +437,6 @@ bool initGraphics( std::string &error ) {
 	frameBufferRGB = new uint8_t[ displaySizeBytes ];
 	memset( frameBufferRGB, 0x85, displaySizeBytes );
 
-	// Load gradient file
-
-	gradientRGB = new uint8_t[ gradientWidth * 3 ];
-	FILE *f = fopen( "../gradients/gradient.bin", "r+" );
-	if ( ! f || fread( gradientRGB, gradientWidth * 3, 1, f ) != 1 ) {
-		if ( f ) fclose( f );
-		error = "Couldn't load '../gradients/gradient.bin.'";
-		return false;
-	}
-	fclose( f );
-
 	//cv::utils::logging::setLogLevel( cv::utils::logging::LOG_LEVEL_SILENT );
 
 	// Load icons
@@ -383,8 +454,14 @@ bool initGraphics( std::string &error ) {
 
 void finishGraphics() {
 
-	delete [] gradientRGB;
-	delete [] frameBufferRGB;
+	if ( gradientRGB ) {
+		delete [] gradientRGB;
+		gradientRGB = NULL;
+	}
+	if ( frameBufferRGB ) {
+		delete [] frameBufferRGB;
+		frameBufferRGB = NULL;
+	}
 
 }
 
@@ -540,5 +617,137 @@ void processKey( int key ) {
 			//println( std::string( "Unrecognized key: " ) + std::to_string( key ) );
 			break;
 	}
+
+}
+
+std::string getOutputDirectory() {
+
+	const char *outputDir = getenv( "YOMBIR_OUTPUT_DIR" );
+	if ( outputDir && outputDir[ 0 ] != 0 ) return std::string( outputDir );
+	return std::string( "." );
+
+}
+
+std::string buildHeadlessOutputFilePath() {
+
+	char timeBuffer[ 64 ];
+	time_t now = time( NULL );
+	struct tm tmNow;
+	localtime_r( &now, &tmNow );
+	strftime( timeBuffer, sizeof( timeBuffer ), "yombir_%Y%m%d_%H%M%S.mp4", &tmNow );
+	return getOutputDirectory() + std::string( "/" ) + std::string( timeBuffer );
+
+}
+
+bool recordHeadless5Seconds( std::string &error, std::string &outputPath ) {
+
+	outputPath = buildHeadlessOutputFilePath();
+	std::string rawOutputPath = outputPath + std::string( ".raw.mp4" );
+	const double fps = captureParams.fps > 0.0 ? captureParams.fps : 24.0;
+	const int warmupFrames = (int)floor( fps * 2.0 + 0.5 );
+	const int targetFrames = (int)floor( fps * 5.0 + 0.5 );
+	const int pixelCount = captureParams.xResolution * captureParams.yResolution;
+	const cv::Size outSize( captureParams.xResolution, captureParams.yResolution );
+
+	cv::VideoWriter writer;
+	int fourcc = cv::VideoWriter::fourcc( 'm', 'p', '4', 'v' );
+	if ( ! writer.open( rawOutputPath, fourcc, fps, outSize, true ) ) {
+		fourcc = cv::VideoWriter::fourcc( 'a', 'v', 'c', '1' );
+		if ( ! writer.open( rawOutputPath, fourcc, fps, outSize, true ) ) {
+			error = std::string( "Could not open MP4 output file for writing: " ) + rawOutputPath;
+			return false;
+		}
+	}
+
+	for ( int i = 0; i < warmupFrames && ! terminate; i ++ ) {
+		if ( ! captureFrame( error ) ) {
+			writer.release();
+			remove( rawOutputPath.c_str() );
+			return false;
+		}
+	}
+
+	for ( int i = 0; i < targetFrames && ! terminate; i ++ ) {
+		if ( ! captureFrame( error ) ) {
+			writer.release();
+			remove( rawOutputPath.c_str() );
+			return false;
+		}
+		const uint16_t *bestPlane = selectBestThermalPlane( captureBuffer, pixelCount );
+		convertThermalGray16LENormalizedToRGB( captureParams.xResolution, captureParams.yResolution, bestPlane, thermalImageRGB, gradientRGB, rotate180 );
+		cv::Mat frame( captureParams.yResolution, captureParams.xResolution, CV_8UC3, thermalImageRGB );
+		writer.write( frame );
+		numFrame++;
+	}
+
+	writer.release();
+
+	if ( ! transcodeToVscodeMp4( rawOutputPath, outputPath, error ) ) return false;
+	remove( rawOutputPath.c_str() );
+	return true;
+
+}
+
+void getFrameMinMax( const uint16_t *frameContents, int pixelCount, uint16_t &minValue, uint16_t &maxValue ) {
+
+	minValue = UINT16_MAX;
+	maxValue = 0;
+	for ( int i = 0; i < pixelCount; i ++ ) {
+		const uint16_t v = frameContents[ i ];
+		if ( v < minValue ) minValue = v;
+		if ( v > maxValue ) maxValue = v;
+	}
+
+}
+
+const uint16_t *selectBestThermalPlane( const uint16_t *buffer, int pixelCount ) {
+
+	const uint16_t *plane0 = buffer;
+	const uint16_t *plane1 = buffer + pixelCount;
+
+	uint16_t min0, max0, min1, max1;
+	getFrameMinMax( plane0, pixelCount, min0, max0 );
+	getFrameMinMax( plane1, pixelCount, min1, max1 );
+
+	const uint32_t range0 = (uint32_t)max0 - (uint32_t)min0;
+	const uint32_t range1 = (uint32_t)max1 - (uint32_t)min1;
+
+	return range1 >= range0 ? plane1 : plane0;
+
+}
+
+std::string shellQuote( std::string text ) {
+
+	std::string out = std::string( "'" );
+	for ( char c : text ) {
+		if ( c == '\'' ) out += std::string( "'\"'\"'" );
+		else out += c;
+	}
+	out += std::string( "'" );
+	return out;
+
+}
+
+bool transcodeToVscodeMp4( std::string inputPath, std::string outputPath, std::string &error ) {
+
+	const std::string inputArg = shellQuote( inputPath );
+	const std::string outputArg = shellQuote( outputPath );
+
+	std::string cmd = std::string( "ffmpeg -y -hide_banner -loglevel error -i " ) +
+		inputArg +
+		std::string( " -an -c:v libx264 -preset veryfast -pix_fmt yuv420p -movflags +faststart " ) +
+		outputArg;
+
+	if ( system( cmd.c_str() ) == 0 ) return true;
+
+	cmd = std::string( "ffmpeg -y -hide_banner -loglevel error -i " ) +
+		inputArg +
+		std::string( " -an -c:v h264_v4l2m2m -pix_fmt yuv420p -movflags +faststart " ) +
+		outputArg;
+
+	if ( system( cmd.c_str() ) == 0 ) return true;
+
+	error = std::string( "Failed to transcode to VSCode-compatible MP4 (H.264). Input was: " ) + inputPath;
+	return false;
 
 }

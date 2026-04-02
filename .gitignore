@@ -13,3 +13,6 @@ videos/*
 
 captures/*
 !captures/README.md
+tiny1B/*
+__MACOSX/*
+*.pyc

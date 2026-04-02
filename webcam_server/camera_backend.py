@@ -4,6 +4,7 @@ import base64
 import collections
 import errno
 import glob
+import hashlib
 import importlib.util
 import json
 import os
@@ -516,6 +517,7 @@ class CameraManager:
     CAPTURE_FRAME_BYTES = CAPTURE_WIDTH * CAPTURE_HEIGHT * 2  # yuyv422 = 2 bytes per pixel
     THERMAL_PLANE_BYTES = THERMAL_WIDTH * THERMAL_HEIGHT * 2   # gray16le plane bytes
     LUT_SIZE = 65536
+    RAW_RING_SIZE = 3
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -533,6 +535,7 @@ class CameraManager:
         self._device = None
         self._latest_frame = None
         self._latest_raw16 = None
+        self._raw_ring = collections.deque(maxlen=self.RAW_RING_SIZE)  # (frame_id, raw16 bytes, ts)
         self._frame_id = 0
         self._jpeg_frame_id = 0
         self._viewer_count = 0
@@ -712,6 +715,7 @@ class CameraManager:
         self._device = device
         self._latest_frame = None
         self._latest_raw16 = None
+        self._raw_ring.clear()
         self._frame_id = 0
         self._jpeg_frame_id = 0
         self._last_error = ""
@@ -1067,8 +1071,9 @@ class CameraManager:
                 # Match yombir: use the second half plane as thermal gray16 data.
                 thermal_plane = raw_frame[half : half + self.THERMAL_PLANE_BYTES]
                 with self._cond:
-                    self._latest_raw16 = thermal_plane
                     self._frame_id += 1
+                    self._latest_raw16 = thermal_plane
+                    self._raw_ring.append((self._frame_id, thermal_plane, time.time()))
                     self._last_frame_ts = time.time()
                     self._cond.notify_all()
 
@@ -1138,6 +1143,7 @@ class CameraManager:
         self._device = None
         self._latest_frame = None
         self._latest_raw16 = None
+        self._raw_ring.clear()
         self._viewer_count = 0
         self._last_client_activity_ts = 0.0
         self._last_frame_ts = 0.0
@@ -1257,13 +1263,30 @@ class CameraManager:
     def wait_for_next_raw_frame(self, prev_id: int, timeout: float = 5.0):
         with self._cond:
             end = time.time() + timeout
-            while self._frame_id <= prev_id and self._running:
+            dropped = False
+
+            while self._running:
+                if self._raw_ring:
+                    oldest_id = self._raw_ring[0][0]
+                    newest_id = self._raw_ring[-1][0]
+                    if prev_id < (oldest_id - 1):
+                        dropped = True
+                    for fid, frame, _ in self._raw_ring:
+                        if fid > prev_id:
+                            return frame, fid, self._running, dropped
+                    # No newer frame yet in ring.
+                    if newest_id > prev_id:
+                        return self._raw_ring[-1][1], newest_id, self._running, dropped
+
                 remain = end - time.time()
                 if remain <= 0:
                     break
                 self._cond.wait(timeout=remain)
 
-            return self._latest_raw16, self._frame_id, self._running
+            if self._raw_ring:
+                fid, frame, _ = self._raw_ring[-1]
+                return frame, fid, self._running, dropped
+            return self._latest_raw16, self._frame_id, self._running, dropped
 
     def wait_for_next_jpeg_frame(self, prev_id: int, timeout: float = 5.0):
         with self._cond:
@@ -1664,6 +1687,9 @@ class PtyTerminalManager:
 
 
 class CameraHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    WS_RAW_MAGIC = b"YRAW"
     manager: CameraManager = None
     metrics: SystemMetricsSampler = None
     terminal: TerminalManager = None
@@ -1682,9 +1708,97 @@ class CameraHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    @staticmethod
+    def _ws_accept_value(key: str) -> str:
+        token = (key + CameraHandler.WS_GUID).encode("utf-8")
+        digest = hashlib.sha1(token).digest()
+        return base64.b64encode(digest).decode("ascii")
+
+    def _ws_send_frame(self, opcode: int, payload: bytes = b""):
+        if payload is None:
+            payload = b""
+        first = 0x80 | (opcode & 0x0F)  # FIN=1, RSV=0
+        plen = len(payload)
+        if plen < 126:
+            header = struct.pack("!BB", first, plen)
+        elif plen <= 0xFFFF:
+            header = struct.pack("!BBH", first, 126, plen)
+        else:
+            header = struct.pack("!BBQ", first, 127, plen)
+        self.wfile.write(header)
+        if plen:
+            self.wfile.write(payload)
+        self.wfile.flush()
+
+    def _ws_send_close(self, code: int = 1000, reason: str = ""):
+        body = struct.pack("!H", int(code))
+        if reason:
+            body += reason.encode("utf-8", errors="ignore")[:120]
+        try:
+            self._ws_send_frame(0x8, body)
+        except Exception:
+            pass
+
+    def _handle_ws_raw_stream(self, parsed):
+        upgrade = (self.headers.get("Upgrade", "") or "").strip().lower()
+        conn_hdr = (self.headers.get("Connection", "") or "").lower()
+        if upgrade != "websocket" or "upgrade" not in conn_hdr:
+            self._json(400, {"error": "websocket upgrade required"})
+            return
+
+        key = (self.headers.get("Sec-WebSocket-Key", "") or "").strip()
+        if not key:
+            self._json(400, {"error": "missing Sec-WebSocket-Key"})
+            return
+
+        accept_val = self._ws_accept_value(key)
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept_val)
+        self.end_headers()
+
+        query = parse_qs(parsed.query or "", keep_blank_values=True)
+        try:
+            after = int(query.get("after", ["-1"])[0])
+        except Exception:
+            after = -1
+
+        try:
+            timeout_ms = int(query.get("timeout_ms", ["2000"])[0])
+        except Exception:
+            timeout_ms = 2000
+        timeout_ms = max(200, min(5000, timeout_ms))
+
+        while True:
+            self.manager.touch_client_activity()
+            frame, frame_id, running, dropped = self.manager.wait_for_next_raw_frame(
+                after, timeout=timeout_ms / 1000.0
+            )
+            if not running:
+                self._ws_send_close(1001, "camera stopped")
+                return
+            if frame is None or frame_id <= after:
+                # No new frame in this cycle; keep waiting.
+                continue
+
+            flags = 1 if dropped else 0
+            header = struct.pack("<4sIII", self.WS_RAW_MAGIC, frame_id, flags, len(frame))
+            try:
+                self._ws_send_frame(0x2, header + frame)  # binary
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception:
+                return
+            after = frame_id
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
+        if path == "/ws/raw":
+            self._handle_ws_raw_stream(parsed)
+            return
+
         if path == "/api/status":
             self._json(200, self.manager.get_status())
             return
@@ -1726,7 +1840,20 @@ class CameraHandler(BaseHTTPRequestHandler):
                 self._json(503, {"error": "camera not running", **status})
                 return
 
-            frame, _, running = self.manager.wait_for_next_raw_frame(-1, timeout=2.0)
+            query = parse_qs(parsed.query or "", keep_blank_values=True)
+            try:
+                after = int(query.get("after", ["-1"])[0])
+            except Exception:
+                after = -1
+            try:
+                timeout_ms = int(query.get("timeout_ms", ["2000"])[0])
+            except Exception:
+                timeout_ms = 2000
+            timeout_ms = max(100, min(5000, timeout_ms))
+
+            frame, frame_id, running, dropped = self.manager.wait_for_next_raw_frame(
+                after, timeout=timeout_ms / 1000.0
+            )
             if not running or frame is None:
                 self._json(503, {"error": "no raw frame available", **self.manager.get_status()})
                 return
@@ -1735,13 +1862,19 @@ class CameraHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
             self.send_header("Pragma", "no-cache")
-            self.send_header("Connection", "close")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Keep-Alive", "timeout=5, max=1000")
             self.send_header("X-Frame-Width", str(self.manager.THERMAL_WIDTH))
             self.send_header("X-Frame-Height", str(self.manager.THERMAL_HEIGHT))
             self.send_header("X-Frame-Format", "gray16le")
+            self.send_header("X-Frame-Id", str(frame_id))
+            self.send_header("X-Frame-Dropped", "1" if dropped else "0")
             self.send_header("Content-Length", str(len(frame)))
             self.end_headers()
-            self.wfile.write(frame)
+            try:
+                self.wfile.write(frame)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
 
         if path == "/frame.jpg":

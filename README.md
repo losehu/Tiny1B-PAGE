@@ -4,7 +4,7 @@
 这是一个面向 Tiny1B/CT256（256×192）等 UVC 热成像模组的本地预览/录制工具：
 
 - **C++ 应用**：编译得到 `yombir`，可全屏预览与录制 `.t16` 原始帧，并支持无桌面环境的 5 秒 MP4 录制。
-- **局域网网页预览（推荐上板子）**：`webcam_server` 提供一个轻量 HTTP 后端（读取 `/dev/video*` 并输出 `gray16le` 原始帧），配合 Nginx 托管网页即可在手机/电脑上低延迟预览。
+- **局域网网页预览（推荐上板子）**：`webcam_server` 提供轻量后端（读取 `/dev/video*`，支持 HTTP 原始帧与 WebSocket 二进制流），配合 Nginx 托管网页可在手机/电脑上低延迟预览。
 
 本文重点：教你在 **泰山派（ARM Linux）** 上 **编译 yombir**，并 **安装 Nginx** 让网页能“点按钮打开摄像头”驱动 Tiny1B/CT256。
 
@@ -113,8 +113,15 @@ python3 webcam_server/camera_backend.py --host 127.0.0.1 --port 18080
 
 - `POST /api/open-camera`：自动查找并启动采集
 - `POST /api/stop-camera`：停止采集
-- `GET /frame.raw`：返回一帧 `gray16le`（256×192×2 bytes）
+- `GET /frame.raw`：HTTP 长轮询取帧（支持 `after`、`timeout_ms`），返回 `gray16le`（256×192×2 bytes）
+- `GET /ws/raw`：WebSocket 二进制持续流（前端主链路）
 - `GET /api/status`、`GET /api/metrics`
+
+说明：
+
+- Web 预览默认优先使用 `WebSocket /ws/raw`，失败时自动回退到 `GET /frame.raw`。
+- 后端内部使用 3 帧小环形队列（追赶最新帧，降低瞬时抖动影响）。
+- 前端默认使用 `OffscreenCanvas + Worker` 做伪彩渲染，浏览器不支持时自动回退主线程渲染。
 
 ### 6.2 Nginx 配置：托管网页 + 反代后端
 
@@ -155,20 +162,42 @@ server {
 		proxy_buffering off;
 	}
 
-	# 反代取帧与可能的流接口
+	# WebSocket 原始帧流（新版主链路）
+	location /ws/ {
+		proxy_pass http://127.0.0.1:18080;
+		proxy_http_version 1.1;
+		proxy_set_header Upgrade $http_upgrade;
+		proxy_set_header Connection "Upgrade";
+		proxy_set_header Host $host;
+		proxy_buffering off;
+		proxy_request_buffering off;
+		proxy_read_timeout 3600s;
+	}
+
+	# HTTP 取帧与兼容流接口（回退链路）
 	location = /frame.raw {
 		proxy_pass http://127.0.0.1:18080;
 		proxy_http_version 1.1;
 		proxy_set_header Host $host;
+		proxy_set_header Connection "";
 		proxy_buffering off;
+		proxy_request_buffering off;
 	}
 	location = /frame.jpg {
 		proxy_pass http://127.0.0.1:18080;
+		proxy_http_version 1.1;
+		proxy_set_header Host $host;
+		proxy_set_header Connection "";
 		proxy_buffering off;
+		proxy_request_buffering off;
 	}
 	location = /stream.mjpg {
 		proxy_pass http://127.0.0.1:18080;
+		proxy_http_version 1.1;
+		proxy_set_header Host $host;
+		proxy_set_header Connection "";
 		proxy_buffering off;
+		proxy_request_buffering off;
 	}
 }
 ```
@@ -220,6 +249,36 @@ sudo systemctl enable --now yombir-webcam
 sudo journalctl -u yombir-webcam -f
 ```
 
+### 6.4（可选）泰山派 WiFi 连接状态指示灯（RGB）
+
+仓库提供了一个小守护程序：根据当前连接的 WiFi SSID 控制泰山派 RGB 灯常亮/闪烁：
+
+- 连接到 `CVPU`：蓝灯常亮
+- 连接到 `losehu`：红灯常亮
+- 连接到其它 WiFi：绿灯常亮
+- 未连接 WiFi：红→绿→蓝 依次亮一下（循环）
+
+脚本在：`utils/taishanpi_wifi_led.py`，systemd 单元模板在：`utils/taishanpi-wifi-led.service`。
+
+安装启用：
+
+```bash
+sudo install -m 0755 utils/taishanpi_wifi_led.py /opt/yombir/utils/taishanpi_wifi_led.py
+sudo cp -futils/taishanpi-wifi-led.service /etc/systemd/system/taishanpi-wifi-led.service
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now taishanpi-wifi-led
+sudo journalctl -u taishanpi-wifi-led -f
+```
+
+如需改 SSID 或 LED 名称（不同系统可能不是 `rgb-led-r/g/b`），编辑 `/etc/systemd/system/taishanpi-wifi-led.service` 的 `ExecStart`，或直接运行：
+
+```bash
+sudo /usr/bin/python3 -u /opt/yombir/utils/taishanpi_wifi_led.py \
+	--ssid-blue CVPU --ssid-red losehu \
+	--led-r rgb-led-r --led-g rgb-led-g --led-b rgb-led-b
+```
+
 ## 7. 常见问题（泰山派上最常见）
 
 ### 7.1 权限不足：打不开 /dev/videoX
@@ -255,9 +314,11 @@ v4l2-ctl --list-devices
 
 ### 7.4 画面有延迟/卡顿
 
-- 确认后端与 Nginx 在同机（`proxy_buffering off` 已关闭缓冲）
+- 确认后端与 Nginx 在同机（`proxy_buffering off`，且 `/ws/` 已配置 `Upgrade` 透传）
 - 安装 `python3-numpy` 可降低 CPU 占用
 - Wi‑Fi 质量差时，建议有线或把泰山派作为 AP/路由旁边
+- 若浏览器不支持 `OffscreenCanvas`，会自动回退主线程渲染，弱设备上可能更易掉帧
+- 若确实有瞬时掉帧：当前策略是“低延迟优先”，会自动追到最新帧（不保证逐帧不丢）
 
 ## 8. 其它文档
 

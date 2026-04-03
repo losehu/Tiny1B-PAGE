@@ -1,0 +1,16 @@
+[Unit]
+Description=TaishanPi WiFi SSID LED indicator
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# 修改为你实际放置仓库的位置（示例：/opt/yombir）
+WorkingDirectory=/opt/yombir
+ExecStart=/usr/bin/python3 -u /opt/yombir/utils/taishanpi_wifi_led.py --ssid-blue CVPU --ssid-red losehu
+Restart=on-failure
+RestartSec=1
+User=root
+
+[Install]
+WantedBy=multi-user.target

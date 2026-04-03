@@ -529,8 +529,8 @@
     const WS_RAW_MAGIC = "YRAW";
 
     // User-configurable range for "real" normalization mode.
-    let realNormMinC = 10;
-    let realNormMaxC = 50;
+    let realNormMinC = 15;
+    let realNormMaxC = 45;
     let realNormRawMin = Math.round((realNormMinC + 273.15) * 16);
     let realNormRawRange = Math.max(1, Math.round((realNormMaxC + 273.15) * 16) - realNormRawMin);
     const REGION_MAX_COUNT = 3;

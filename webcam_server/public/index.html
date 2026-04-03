@@ -1072,7 +1072,7 @@
       const label =
         colorNormMode === "adaptive"
           ? "自适应"
-          : `真实值${realNormMinC}~${realNormMaxC}°C`;
+          : `${realNormMinC}~${realNormMaxC}°C`;
       normModeBtn.textContent = `按钮五（温度归一化：${label}）`;
       const showRealRangeInputs = colorNormMode === "real_custom";
       normRangeBox.style.display = showRealRangeInputs ? "flex" : "none";
@@ -1903,9 +1903,9 @@
       } else {
         const ok = validateAndApplyRealNormRange({ announce: false });
         if (ok) {
-          setStatus(`温度归一化已切换：真实值${realNormMinC}~${realNormMaxC}°C`, "ok");
+          setStatus(`温度归一化已切换：${realNormMinC}~${realNormMaxC}°C`, "ok");
         } else {
-          setStatus(`温度归一化已切换：真实值（输入未通过校验，沿用上次有效范围 ${realNormMinC}~${realNormMaxC}°C）`, "warn");
+          setStatus(`温度归一化已切换：（输入未通过校验，沿用上次有效范围 ${realNormMinC}~${realNormMaxC}°C）`, "warn");
         }
       }
     });

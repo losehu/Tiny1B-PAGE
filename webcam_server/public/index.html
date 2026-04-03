@@ -533,7 +533,8 @@
     let realNormMaxC = 45;
     let realNormRawMin = Math.round((realNormMinC + 273.15) * 16);
     let realNormRawRange = Math.max(1, Math.round((realNormMaxC + 273.15) * 16) - realNormRawMin);
-    const REGION_MAX_COUNT = 3;
+    const REGION_HIGH_COUNT = 2;
+    const REGION_LOW_COUNT = 2;
     const REGION_RECALC_MS = 160;
     const MARKER_CANDIDATES = [
       [255, 255, 255],
@@ -578,7 +579,7 @@
     let colorNormMode = "adaptive"; // adaptive | real_custom
     let visitedToken = 1;
     let lastRegionCalcTs = 0;
-    let cachedHotRegions = [];
+    let cachedExtremeRegions = [];
     let pseudoFullscreenActive = false;
     let pseudoFsScrollTop = 0;
     let pseudoFsScrollLeft = 0;
@@ -672,7 +673,7 @@
             if (typeof bitmap.close === "function") bitmap.close();
           }
           if (hotspotEnabled && Array.isArray(regions) && regions.length > 0) {
-            drawHotRegions(regions);
+            drawExtremeRegions(regions);
           }
           showStream();
           applyRotation();
@@ -789,11 +790,11 @@
       if (hotspotEnabled) {
         const { minV, maxV } = decodeRawForHotspot(arrayBuffer);
         const now = performance.now();
-        if ((now - lastRegionCalcTs) >= REGION_RECALC_MS || cachedHotRegions.length === 0) {
-          cachedHotRegions = detectHotRegions(minV, maxV);
+        if ((now - lastRegionCalcTs) >= REGION_RECALC_MS || cachedExtremeRegions.length === 0) {
+          cachedExtremeRegions = detectExtremeRegions(minV, maxV);
           lastRegionCalcTs = now;
         }
-        regions = cachedHotRegions;
+        regions = cachedExtremeRegions;
       }
       queueFrameToWorker(arrayBuffer, frameId, regions);
     }
@@ -1600,19 +1601,15 @@
       }
     }
 
-    function detectHotRegions(minV, maxV) {
-      const range = maxV - minV;
-      if (range <= 0) return [];
-
-      // Adaptive threshold: keep higher-temperature structures, suppress noise.
-      const hotThreshold = minV + Math.max(48, Math.floor(range * 0.72));
+    function detectHotRegionsByThreshold(thresholdRaw) {
       nextVisitedToken();
-
       const allRegions = [];
 
       for (let start = 0; start < pixelCount; start++) {
         if (visited[start] === visitedToken) continue;
-        if (displayRaw16[start] < hotThreshold) continue;
+
+        const v0 = displayRaw16[start];
+        if (v0 < thresholdRaw) continue;
 
         let head = 0;
         let tail = 0;
@@ -1654,7 +1651,8 @@
             for (let nx = x0; nx <= x1; nx++) {
               const nidx = row + nx;
               if (visited[nidx] === visitedToken) continue;
-              if (displayRaw16[nidx] < hotThreshold) continue;
+              const nv = displayRaw16[nidx];
+              if (nv < thresholdRaw) continue;
               visited[nidx] = visitedToken;
               bfsQueue[tail++] = nidx;
             }
@@ -1662,7 +1660,16 @@
         }
 
         const tempC = (maxRaw / 16.0) - 273.15;
-        allRegions.push({ area, maxRaw, maxIdx, minX, minY, maxX, maxY, tempC });
+        allRegions.push({
+          area,
+          raw: maxRaw,
+          idx: maxIdx,
+          minX,
+          minY,
+          maxX,
+          maxY,
+          tempC,
+        });
       }
 
       if (allRegions.length === 0) return [];
@@ -1673,11 +1680,47 @@
       if (regions.length === 0) regions = allRegions;
 
       regions.sort((a, b) => {
-        if (b.maxRaw !== a.maxRaw) return b.maxRaw - a.maxRaw;
+        if (b.raw !== a.raw) return b.raw - a.raw;
         return b.area - a.area;
       });
+      return regions;
+    }
 
-      return regions.slice(0, REGION_MAX_COUNT);
+    function detectExtremeRegions(minV, maxV) {
+      const range = maxV - minV;
+      if (range <= 0) return [];
+
+      const span = Math.max(48, Math.floor(range * 0.72));
+      // Adaptive threshold: keep higher-temperature structures, suppress noise.
+      const hotThreshold = minV + span;
+
+      const regions = detectHotRegionsByThreshold(hotThreshold);
+      if (!regions || regions.length === 0) return [];
+
+      const used = new Set();
+      const selected = [];
+
+      // Lowest N (based on region max temperature), ordered low -> high.
+      const lows = regions.slice(-REGION_LOW_COUNT).sort((a, b) => a.raw - b.raw);
+      for (let i = 0; i < lows.length; i++) {
+        const r = lows[i];
+        if (!r || !Number.isInteger(r.idx)) continue;
+        if (used.has(r.idx)) continue;
+        used.add(r.idx);
+        selected.push({ ...r, kind: "low" });
+      }
+
+      // Highest N, ordered high -> low.
+      const highs = regions.slice(0, REGION_HIGH_COUNT);
+      for (let i = 0; i < highs.length; i++) {
+        const r = highs[i];
+        if (!r || !Number.isInteger(r.idx)) continue;
+        if (used.has(r.idx)) continue;
+        used.add(r.idx);
+        selected.push({ ...r, kind: "high" });
+      }
+
+      return selected;
     }
 
     function pickContrastColorAt(x, y) {
@@ -1739,7 +1782,7 @@
       };
     }
 
-    function drawHotRegions(regions) {
+    function drawExtremeRegions(regions) {
       if (!regions || regions.length === 0) return;
 
       streamCtx.save();
@@ -1748,11 +1791,27 @@
       streamCtx.textBaseline = "middle";
       streamCtx.lineJoin = "round";
 
+      let lowSeq = 0;
+      let highSeq = 0;
+
       for (let i = 0; i < regions.length; i++) {
         const r = regions[i];
-        const hx = r.maxIdx % THERMAL_W;
-        const hy = (r.maxIdx / THERMAL_W) | 0;
-        const label = Number.isFinite(r.tempC) ? `${r.tempC.toFixed(1)}°C` : `--.-°C`;
+        const idx = Number.isInteger(r.idx) ? r.idx : (Number.isInteger(r.maxIdx) ? r.maxIdx : -1);
+        if (idx < 0) continue;
+        const hx = idx % THERMAL_W;
+        const hy = (idx / THERMAL_W) | 0;
+
+        let prefix = "";
+        if (r.kind === "low") {
+          lowSeq += 1;
+          prefix = `低${lowSeq}: `;
+        } else if (r.kind === "high") {
+          highSeq += 1;
+          prefix = `高${highSeq}: `;
+        }
+
+        const value = Number.isFinite(r.tempC) ? `${r.tempC.toFixed(1)}°C` : `--.-°C`;
+        const label = prefix + value;
         const c = pickContrastColorAt(hx, hy);
 
         streamCtx.fillStyle = c.fill;
@@ -1763,7 +1822,9 @@
         streamCtx.fill();
         streamCtx.stroke();
 
-        const tx = Math.min(Math.max(hx + 6, 2), THERMAL_W - 72);
+        const tw = streamCtx.measureText(label).width;
+        const maxTx = Math.max(2, THERMAL_W - tw - 2);
+        const tx = Math.min(Math.max(hx + 6, 2), maxTx);
         const ty = Math.min(Math.max(hy - 8, 8), THERMAL_H - 8);
         streamCtx.strokeStyle = c.stroke;
         streamCtx.lineWidth = 2.2;
@@ -1808,11 +1869,11 @@
 
       if (hotspotEnabled) {
         const now = performance.now();
-        if ((now - lastRegionCalcTs) >= REGION_RECALC_MS || cachedHotRegions.length === 0) {
-          cachedHotRegions = detectHotRegions(minV, maxV);
+        if ((now - lastRegionCalcTs) >= REGION_RECALC_MS || cachedExtremeRegions.length === 0) {
+          cachedExtremeRegions = detectExtremeRegions(minV, maxV);
           lastRegionCalcTs = now;
         }
-        drawHotRegions(cachedHotRegions);
+        drawExtremeRegions(cachedExtremeRegions);
       }
 
       showStream();
@@ -1883,8 +1944,8 @@
     hotspotBtn.addEventListener("click", () => {
       hotspotEnabled = !hotspotEnabled;
       hotspotBtn.textContent = `按钮三（区域温度：${hotspotEnabled ? "开" : "关"}）`;
-      cachedHotRegions = [];
-      setStatus(`区域温度显示已${hotspotEnabled ? "开启" : "关闭"}（最多3个连通区域）`, "ok");
+      cachedExtremeRegions = [];
+      setStatus(`区域温度显示已${hotspotEnabled ? "开启" : "关闭"}（最低${REGION_LOW_COUNT} + 最高${REGION_HIGH_COUNT} 个连通区域）`, "ok");
     });
 
     normModeBtn.addEventListener("click", () => {
